@@ -55,20 +55,20 @@ class ActorNetwork(nn.Module):
 
         return mu, sigma
     
-    def sample_normal(self, state, reparameterize=True):
+    def sample_normal(self, state, reparameterize=True): # tanh squash + log-prob 修正。
         mu, sigma = self.forward(state)
         dist = Normal(mu, sigma)
 
         if reparameterize:
-            raw_action = dist.rsample()
+            raw_action = dist.rsample() # 使用reparameterization trick,允许梯度从动作反传回mu和sigma
         else:
-            raw_action = dist.sample()
-
+            raw_action = dist.sample() # 直接从Normal(mu, sigma)采样,不支持反向传播
+        
         tanh_action = torch.tanh(raw_action)
         scaled_action = tanh_action * self.max_action
 
         log_prob = dist.log_prob(raw_action)
-        log_prob -= torch.log(1 - tanh_action.pow(2) + self.tiny_positive)
+        log_prob -= torch.log(1 - tanh_action.pow(2) + self.tiny_positive) # tanh 的 log-det-Jacobian 修正
         log_prob = log_prob.sum(dim=1, keepdim=True)
 
         return scaled_action, log_prob
@@ -115,6 +115,11 @@ class SACAgent:
         self.alpha = alpha
         self.tau = tau
         self.batch_size = batch_size
+        # 自动调节 alpha
+        self.target_entropy = -action_dim  # SAC 论文推荐
+        self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=device)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=actor_lr)
+
 
         self.buffer = ReplayBuffer(buffer_size, state_dim, action_dim)
 
@@ -122,11 +127,11 @@ class SACAgent:
         self.critic_2 = CriticNetwork(state_dim, action_dim, layer1_dim, layer2_dim, critic_lr).to(device)
         self.target_critic_1 = CriticNetwork(state_dim, action_dim, layer1_dim, layer2_dim, critic_lr).to(device)
         self.target_critic_2 = CriticNetwork(state_dim, action_dim, layer1_dim, layer2_dim, critic_lr).to(device)
-        self.target_critic_1.load_state_dict(self.critic_1.state_dict())
+        self.target_critic_1.load_state_dict(self.critic_1.state_dict()) # 把 critic的所有参数复制到 target_critic
         self.target_critic_2.load_state_dict(self.critic_2.state_dict())
         self.actor = ActorNetwork(state_dim, action_dim, layer1_dim, layer2_dim, max_action, actor_lr).to(device)
 
-    def get_action(self, state, eval_mode=False):
+    def get_action(self, state):
         state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         action, _ = self.actor.sample_normal(state, reparameterize=False)
         action = action.cpu().detach().numpy()[0]
@@ -185,6 +190,16 @@ class SACAgent:
         actor_loss.backward()
         self.actor.optimizer.step()
         self.update_network_parameters()
+
+        # 4. 更新 alpha（自动调节）
+        alpha_loss = -(self.log_alpha * (logp + self.target_entropy).detach()).mean()
+
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+
+        self.alpha = self.log_alpha.exp()
+
 
 
 # ======================
