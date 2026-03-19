@@ -50,7 +50,7 @@ class ActorNetwork(nn.Module):
         x = F.relu(self.fc2(x))
         mu = self.mu(x)
         log_std = self.log_std(x)
-        log_std = torch.clamp(log_std, min=-5, max=1)
+        log_std = torch.clamp(log_std, min=-20, max=2)
         sigma = log_std.exp()
 
         return mu, sigma
@@ -198,7 +198,7 @@ class SACAgent:
         alpha_loss.backward()
         self.alpha_optimizer.step()
 
-        self.alpha = self.log_alpha.exp().clamp(0.01, 0.2)
+        self.alpha = self.log_alpha.exp()
 
 
 # ======================
@@ -213,7 +213,7 @@ max_action = float(env.action_space.high[0])
 REPLAYBUFFER_SIZE = 1000000
 max_episodes = 600
 max_steps = 300
-start_steps = 10000 # 添加随机动作预热步数
+start_steps = 2000 # 添加随机动作预热步数
 
 agent = SACAgent(state_dim, action_dim, REPLAYBUFFER_SIZE,
                  alpha=0.2, critic_lr=3e-4, actor_lr=3e-4, gamma=0.99, tau=0.005,
@@ -236,7 +236,7 @@ for episode in range(max_episodes):
             action = agent.get_action(state)
 
         next_state, reward, terminated, truncated, info = env.step(action)
-        done = terminated 
+        done = terminated or truncated
         scaled_reward = reward 
 
         agent.add_buffer(state, action, scaled_reward, next_state, done)
