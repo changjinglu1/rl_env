@@ -79,7 +79,7 @@ def test_sac(env, actor, episodes=10):
 # ===========================
 
 if __name__ == "__main__":
-    env = gym.make("LunarLanderContinuous-v3", render_mode="human")
+    env = gym.make("HalfCheetah-v5", render_mode="human")
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
@@ -87,7 +87,7 @@ if __name__ == "__main__":
     # 修改这里：你的 SAC 模型路径
     current_path = os.path.dirname(os.path.realpath(__file__))
     model = current_path + "/models/"
-    actor_path = model + "sac_actor_20260318123131.pth"
+    actor_path = model + "sac_actor_20260319164458.pth"
 
     # 创建 SAC Actor
     actor = SACActor(state_dim, action_dim, max_action).to(device)
