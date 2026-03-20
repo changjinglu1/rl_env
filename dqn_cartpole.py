@@ -6,7 +6,10 @@ import random
 import numpy as np
 from collections import deque
 import matplotlib.pyplot as plt
-
+import Gridworld
+from gymnasium.wrappers import FlattenObservation
+import os
+import time
 
 # Q网络定义
 class QNet(nn.Module):
@@ -20,7 +23,8 @@ class QNet(nn.Module):
         return self.fc(x)
 
 # 环境 & 参数
-env = gym.make("CartPole-v1")
+env = gym.make("gymnasium_env/GridWorld-v0")
+env = FlattenObservation(env) # dic->向量
 state_dim, action_dim = env.observation_space.shape[0], env.action_space.n
 qnet = QNet(state_dim, action_dim)
 optimizer = optim.Adam(qnet.parameters(), lr=1e-3)
@@ -44,7 +48,8 @@ for episode in range(200):
     
     for t in range(200):
         action = select_action(state)
-        next_state, reward, done, _, _ = env.step(action)
+        next_state, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
         buffer.append((state, action, reward, next_state, done))
         state = next_state
         total_reward += reward
@@ -70,7 +75,21 @@ for episode in range(200):
 
         if done: break
     rewards.append(total_reward)
+
+    avg_reward = np.mean(rewards[-10:])  # 最近 10 回合平均
+    best_reward = -np.inf
+
     print(f"Episode {episode}, Reward: {total_reward}")
+    if episode >= 50 and avg_reward > best_reward:
+        best_reward = avg_reward
+        current_path = os.path.dirname(os.path.realpath(__file__))
+        save_dir = os.path.join(current_path, "models")
+        os.makedirs(save_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d%H%M%S")
+        torch.save(qnet.state_dict(), os.path.join(save_dir, f"sac_actor_gridworld{timestamp}.pth"))
+        print(f"saving model with best reward: {best_reward:.1f}")
+
+env.close()
 
 plt.plot(rewards)
 plt.xlabel('Episode')
