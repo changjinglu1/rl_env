@@ -4,14 +4,17 @@ import numpy as np
 from gymnasium.wrappers import FlattenObservation
 from dqn_cartpole import QNet   # 你训练时定义的 QNet
 import time
+import Gridworld
 
 # ============================
 # 1. 加载环境
 # ============================
 env = gym.make("gymnasium_env/GridWorld-v0", render_mode="human")
+env = FlattenObservation(env)
 
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.n
+
 
 # ============================
 # 2. 加载训练好的模型
@@ -28,6 +31,7 @@ print("Loaded model:", model_path)
 # 3. 测试回合
 # ============================
 state, _ = env.reset()
+env.render()  # 渲染环境
 total_reward = 0
 done = False
 
