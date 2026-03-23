@@ -85,12 +85,15 @@ class GridworldEnv(gym.Env):
 
     def step(self, action):
         reward = 0
+        old_position = self.agent_position.copy()
+        old_distance = np.linalg.norm(old_position - self.target_position, ord=1)
         # Map the discrete action (0-3) to a movement direction
         direction = self._action_to_direction[action]
         # Update agent position, ensuring it stays within grid bounds
         new_position = np.clip(self.agent_position + direction, 0, self.size-1)
         # Check if hit teh wall
-        if self._is_wall(self.agent_position,new_position):
+        hit_wall = self._is_wall(self.agent_position,new_position)
+        if hit_wall:
             reward -= 0.1
         else:
             self.agent_position = new_position
@@ -98,7 +101,15 @@ class GridworldEnv(gym.Env):
         terminated = np.array_equal(self.agent_position, self.target_position)
         truncated = False
 
-        reward = 1 if terminated else -0.1
+        if terminated:
+            reward = 3
+        else:
+            new_distance = np.linalg.norm(self.agent_position - self.target_position, ord=1)
+            # Potential-based shaping: strong incentive to approach target
+            progress = old_distance - new_distance
+            reward += -0.04 + 0.15 * progress  
+
+
         observation = self._get_obs()
         info = self._get_info()
 
@@ -154,18 +165,18 @@ class GridworldEnv(gym.Env):
                     WALL_WIDTH
                 )
 
-            if self.render_mode == "human":
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        pygame.quit()
-                        exit()
+        if self.render_mode == "human":
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    exit()
 
-                self.window.blit(canvas, canvas.get_rect())
-                pygame.event.pump()
-                pygame.display.update()
-                self.clock.tick(self.metadata["render_fps"])
-            else: #rgb_array
-                return np.transpose(np.array(pygame.surfarray.array3d(canvas)), axes=(1, 0, 2))
+            self.window.blit(canvas, canvas.get_rect())
+            pygame.event.pump()
+            pygame.display.update()
+            self.clock.tick(self.metadata["render_fps"])
+        else: #rgb_array
+            return np.transpose(np.array(pygame.surfarray.array3d(canvas)), axes=(1, 0, 2))
         
     def close(self):
         if self.window is not None:
