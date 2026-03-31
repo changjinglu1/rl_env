@@ -1,0 +1,1054 @@
+# pyright: reportMissingImports=false
+import argparse
+import os
+import shutil
+import time
+from dataclasses import dataclass
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def try_import_jax_brax():
+    try:
+        import flax.linen as nn
+        import jax
+        import jax.numpy as jnp
+        import optax
+        from flax.training import train_state
+        from brax import envs
+
+        return nn, jax, jnp, optax, train_state, envs
+    except Exception as exc:
+        print("Missing JAX/Brax stack.")
+        print("Please install dependencies first, for example:")
+        print("  pip install --upgrade pip")
+        print("  pip install brax flax optax matplotlib")
+        print(f"Import error: {exc}")
+        return None
+
+
+@dataclass
+class Config:
+    # Brax environment config.
+    env_name: str = "halfcheetah"
+    backend: str = "spring"
+    seed: int = 42
+
+    total_steps: int = 20_000_000
+    num_envs: int = 256
+    episode_length: int = 1000
+
+    hidden_dim: int = 256
+    gamma: float = 0.99
+    tau: float = 0.005
+    batch_size: int = 256
+    start_steps: int = 5_000
+    # Gradient updates per environment step (can be fractional).
+    updates_per_step: float = 0.25
+    # Hard cap to avoid very slow iterations when num_envs is large.
+    max_sac_updates_per_iter: int = 8
+    # Prevent entropy temperature from collapsing too far.
+    log_alpha_min: float = -3.0
+    # Also cap alpha from growing too large.
+    log_alpha_max: float = 0.0
+
+    actor_lr: float = 1e-4
+    critic_lr: float = 1e-4
+    alpha_lr: float = 1e-4
+    model_lr: float = 1e-4
+    grad_clip_norm: float = 5.0
+
+    alpha_init: float = 0.2
+
+    real_buffer_size: int = 1_000_000
+    model_buffer_size: int = 800_000
+    real_ratio: float = 0.9 # 每次 SAC 更新时，real_ratio 控制了从真实环境数据和模型生成数据中采样的比例。
+    # Before this step, SAC updates use only real data to avoid early model bias.
+    model_warmup_steps: int = 300_000
+
+    ensemble_size: int = 8
+    model_train_epochs: int = 5
+    model_train_batches: int = 200
+    model_train_freq: int = 5_000
+    model_rollout_freq: int = 5_000
+    model_rollout_batch: int = 2_000
+    model_rollout_horizon: int = 2
+    # Keep only the lowest-uncertainty synthetic transitions.
+    rollout_keep_ratio: float = 0.3
+    # Optional hard threshold on ensemble disagreement (0 disables threshold).
+    max_model_disagreement: float = 0.0
+
+    eval_every: int = 50_000
+    eval_episodes: int = 1
+    log_every: int = 5_000
+    smooth_window: int = 7
+
+
+class ReplayBuffer:
+    # Host-side ring buffer storing transitions as NumPy arrays.
+    def __init__(self, capacity: int, obs_dim: int, act_dim: int):
+        self.capacity = int(capacity)
+        self.obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.act = np.zeros((capacity, act_dim), dtype=np.float32)
+        self.rew = np.zeros((capacity, 1), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.not_done = np.zeros((capacity, 1), dtype=np.float32)
+        self.ptr = 0
+        self.size = 0
+
+    def add_batch(
+        self,
+        obs: np.ndarray,
+        act: np.ndarray,
+        rew: np.ndarray,
+        next_obs: np.ndarray,
+        not_done: np.ndarray,
+    ) -> None:
+        # Supports vectorized env inserts and wrap-around writes.
+        n = int(obs.shape[0])
+        end = self.ptr + n
+
+        rew2 = rew.reshape(-1, 1).astype(np.float32)
+        nd2 = not_done.reshape(-1, 1).astype(np.float32)
+
+        if end <= self.capacity:
+            self.obs[self.ptr:end] = obs
+            self.act[self.ptr:end] = act
+            self.rew[self.ptr:end] = rew2
+            self.next_obs[self.ptr:end] = next_obs
+            self.not_done[self.ptr:end] = nd2
+        else:
+            first = self.capacity - self.ptr
+            second = end - self.capacity
+            self.obs[self.ptr:] = obs[:first]
+            self.act[self.ptr:] = act[:first]
+            self.rew[self.ptr:] = rew2[:first]
+            self.next_obs[self.ptr:] = next_obs[:first]
+            self.not_done[self.ptr:] = nd2[:first]
+
+            self.obs[:second] = obs[first:]
+            self.act[:second] = act[first:]
+            self.rew[:second] = rew2[first:]
+            self.next_obs[:second] = next_obs[first:]
+            self.not_done[:second] = nd2[first:]
+
+        self.ptr = (self.ptr + n) % self.capacity
+        self.size = min(self.size + n, self.capacity)
+
+    def sample(self, batch_size: int) -> dict[str, np.ndarray]:
+        idx = np.random.randint(0, self.size, size=(batch_size,))
+        return {
+            "obs": self.obs[idx],
+            "act": self.act[idx],
+            "rew": self.rew[idx],
+            "next_obs": self.next_obs[idx],
+            "not_done": self.not_done[idx],
+        }
+
+    def sample_obs(self, batch_size: int) -> np.ndarray:
+        idx = np.random.randint(0, self.size, size=(batch_size,))
+        return self.obs[idx]
+
+    def all_data(self) -> dict[str, np.ndarray]:
+        n = self.size
+        return {
+            "obs": self.obs[:n],
+            "act": self.act[:n],
+            "rew": self.rew[:n],
+            "next_obs": self.next_obs[:n],
+            "not_done": self.not_done[:n],
+        }
+
+
+class RunningNorm:
+    # Running statistics used to normalize dynamics model inputs/targets.
+    def __init__(self, in_dim: int, out_dim: int):
+        self.in_mean = np.zeros((in_dim,), dtype=np.float32)
+        self.in_std = np.ones((in_dim,), dtype=np.float32)
+        self.out_mean = np.zeros((out_dim,), dtype=np.float32)
+        self.out_std = np.ones((out_dim,), dtype=np.float32)
+
+    def update(self, obs: np.ndarray, act: np.ndarray, next_obs: np.ndarray, rew: np.ndarray) -> None:
+        sa = np.concatenate([obs, act], axis=-1)
+        delta = next_obs - obs
+        out = np.concatenate([delta, rew], axis=-1)
+
+        self.in_mean = sa.mean(axis=0)
+        self.in_std = np.clip(sa.std(axis=0), 1e-3, None)
+        self.out_mean = out.mean(axis=0)
+        self.out_std = np.clip(out.std(axis=0), 1e-3, None)
+
+
+
+def build_modules(nn, jnp, obs_dim: int, act_dim: int, hidden_dim: int):
+    class Actor(nn.Module):
+        @nn.compact
+        def __call__(self, obs):
+            x = nn.Dense(hidden_dim)(obs)
+            x = nn.relu(x)
+            x = nn.Dense(hidden_dim)(x)
+            x = nn.relu(x)
+            mu = nn.Dense(act_dim)(x)
+            log_std = nn.Dense(act_dim)(x)
+            log_std = jnp.clip(log_std, -5.0, 2.0)
+            return mu, log_std
+
+    class Critic(nn.Module):
+        @nn.compact
+        def __call__(self, obs, act):
+            x = jnp.concatenate([obs, act], axis=-1)
+            x = nn.Dense(hidden_dim)(x)
+            x = nn.relu(x)
+            x = nn.Dense(hidden_dim)(x)
+            x = nn.relu(x)
+            q = nn.Dense(1)(x)
+            return q.squeeze(-1)
+
+    class Dynamics(nn.Module):
+        @nn.compact
+        def __call__(self, obs, act):
+            x = jnp.concatenate([obs, act], axis=-1)
+            x = nn.Dense(hidden_dim)(x)
+            x = nn.relu(x)
+            x = nn.Dense(hidden_dim)(x)
+            x = nn.relu(x)
+            # Predict [delta_state, reward] with heteroscedastic uncertainty.
+            out_dim = obs_dim + 1
+            mean = nn.Dense(out_dim)(x)
+            logvar = nn.Dense(out_dim)(x)
+            logvar = jnp.clip(logvar, -10.0, 2.0)
+            return mean, logvar
+
+    return Actor(), Critic(), Dynamics()
+
+
+def make_sac_fns(
+    jax,
+    jnp,
+    optax,
+    actor_def,
+    critic_def,
+    max_action: float,
+    gamma: float,
+    target_entropy: float,
+    alpha_tx,
+    log_alpha_min: float,
+    log_alpha_max: float,
+):
+    log_2pi = np.log(2.0 * np.pi).astype(np.float32)
+
+    def sample_action(actor_params, obs, key, deterministic: bool):
+        # Tanh-Gaussian policy: sample pre_tanh action then squash to [-1, 1].
+        mu, log_std = actor_def.apply(actor_params, obs)
+        std = jnp.exp(log_std)
+        if deterministic:
+            pre_tanh = mu
+        else: # 重参数化采样
+            noise = jax.random.normal(key, shape=mu.shape)
+            pre_tanh = mu + std * noise
+        squashed = jnp.tanh(pre_tanh)
+        action = squashed * max_action
+
+        gaussian_logp = -0.5 * (((pre_tanh - mu) / (std + 1e-8)) ** 2 + 2.0 * log_std + log_2pi)
+        gaussian_logp = gaussian_logp.sum(axis=-1)
+        correction = jnp.log(1.0 - squashed**2 + 1e-6).sum(axis=-1)
+        logp = gaussian_logp - correction
+        return action, logp
+
+    @jax.jit
+    def update_step( # 一整套 SAC 一步更新，顺序是“先 critic，再 actor，再 alpha，再 target网络软更新”
+        actor_state,
+        critic1_state,
+        critic2_state,
+        target_critic1_params,
+        target_critic2_params,
+        log_alpha,
+        alpha_opt_state,
+        batch,
+        tau: float,
+        key,
+    ):
+        obs = batch["obs"]
+        act = batch["act"]
+        rew = batch["rew"].squeeze(-1)
+        next_obs = batch["next_obs"]
+        not_done = batch["not_done"].squeeze(-1)
+
+        # 随机种子key1 for bootstrap target action, key2 for policy gradient action.
+        key1, key2 = jax.random.split(key)
+
+        alpha = jnp.exp(log_alpha)
+
+        next_action, next_logp = sample_action(actor_state.params, next_obs, key1, deterministic=False)
+        next_q1 = critic_def.apply(target_critic1_params, next_obs, next_action)
+        next_q2 = critic_def.apply(target_critic2_params, next_obs, next_action)
+        # SAC Bellman backup with entropy bonus.
+        target_q = rew + gamma * not_done * (jnp.minimum(next_q1, next_q2) - alpha * next_logp)
+
+        def critic_loss_fn(critic1_params, critic2_params):
+            q1 = critic_def.apply(critic1_params, obs, act)
+            q2 = critic_def.apply(critic2_params, obs, act)
+            loss = ((q1 - target_q) ** 2 + (q2 - target_q) ** 2).mean()
+            return loss
+
+        critic_loss, (critic1_grads, critic2_grads) = jax.value_and_grad(
+            critic_loss_fn, argnums=(0, 1)
+        )(critic1_state.params, critic2_state.params)
+
+        critic1_state = critic1_state.apply_gradients(grads=critic1_grads)
+        critic2_state = critic2_state.apply_gradients(grads=critic2_grads)
+
+        def actor_loss_fn(actor_params):
+            new_action, logp = sample_action(actor_params, obs, key2, deterministic=False)
+            q1_pi = critic_def.apply(critic1_state.params, obs, new_action)
+            q2_pi = critic_def.apply(critic2_state.params, obs, new_action)
+            q_pi = jnp.minimum(q1_pi, q2_pi)
+            return (alpha * logp - q_pi).mean(), logp
+
+        (actor_loss, logp), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
+        actor_state = actor_state.apply_gradients(grads=actor_grads)
+
+        def alpha_loss_fn(log_alpha_val):
+            # Tune alpha to match target entropy.
+            entropy_term = jax.lax.stop_gradient(logp + target_entropy)
+            return -(log_alpha_val * entropy_term.mean())
+
+        alpha_loss, alpha_grad = jax.value_and_grad(alpha_loss_fn)(log_alpha)
+        alpha_updates, alpha_opt_state = alpha_tx.update(alpha_grad, alpha_opt_state)
+        log_alpha = optax.apply_updates(log_alpha, alpha_updates)
+        log_alpha = jnp.clip(log_alpha, log_alpha_min, log_alpha_max)
+
+        # Polyak averaging for target critics.
+        target_critic1_params = jax.tree.map(
+            lambda t, s: (1.0 - tau) * t + tau * s,
+            target_critic1_params,
+            critic1_state.params,
+        )
+        target_critic2_params = jax.tree.map(
+            lambda t, s: (1.0 - tau) * t + tau * s,
+            target_critic2_params,
+            critic2_state.params,
+        )
+
+        metrics = {
+            "actor": actor_loss,
+            "critic": critic_loss,
+            "alpha_loss": alpha_loss,
+            "alpha": jnp.exp(log_alpha),
+        }
+        return (
+            actor_state,
+            critic1_state,
+            critic2_state,
+            target_critic1_params,
+            target_critic2_params,
+            log_alpha,
+            alpha_opt_state,
+            metrics,
+        )
+
+    return sample_action, update_step
+
+
+def make_dynamics_fns(jax, jnp, optax, dynamics_def):
+    @jax.jit
+    def train_one_model(model_state, batch, in_mean, in_std, out_mean, out_std):
+        obs = batch["obs"]
+        act = batch["act"]
+        rew = batch["rew"]
+        next_obs = batch["next_obs"]
+
+        # MBPO dynamics target: delta state and one-step reward.
+        target = jnp.concatenate([next_obs - obs, rew], axis=-1)
+
+        sa = jnp.concatenate([obs, act], axis=-1)
+        sa_n = (sa - in_mean) / (in_std + 1e-6)
+        tar_n = (target - out_mean) / (out_std + 1e-6)
+
+        s_n = sa_n[:, : obs.shape[-1]]
+        a_n = sa_n[:, obs.shape[-1] :]
+
+        def loss_fn(params):
+            mu, logvar = dynamics_def.apply(params, s_n, a_n)
+            inv_var = jnp.exp(-logvar)
+            # Gaussian NLL lets each model express aleatoric uncertainty.
+            nll = ((mu - tar_n) ** 2 * inv_var + logvar).mean()
+            return nll
+
+        loss, grads = jax.value_and_grad(loss_fn)(model_state.params)
+        model_state = model_state.apply_gradients(grads=grads)
+        return model_state, loss
+
+    @jax.jit
+    def predict_one(model_params, obs, act, in_mean, in_std, out_mean, out_std, key):
+        sa = jnp.concatenate([obs, act], axis=-1)
+        sa_n = (sa - in_mean) / (in_std + 1e-6)
+        obs_dim = obs.shape[-1]
+        s_n = sa_n[:, :obs_dim]
+        a_n = sa_n[:, obs_dim:]
+
+        mu, logvar = dynamics_def.apply(model_params, s_n, a_n)
+        std = jnp.exp(0.5 * logvar)
+        pred_n = mu + std * jax.random.normal(key, shape=mu.shape)
+        pred = pred_n * (out_std + 1e-6) + out_mean
+        delta = pred[:, :obs_dim]
+        reward = pred[:, obs_dim:]
+        next_obs = obs + delta
+        return next_obs, reward
+
+    return train_one_model, predict_one
+
+
+def evaluate_policy(
+    cfg: Config,
+    env,
+    actor_params,
+    sample_action_fn,
+    reset_fn,
+    step_fn,
+    jax,
+    jnp,
+) -> dict[str, float]:
+    # Deterministic actor evaluation on one environment instance.
+    returns = []
+    returns_run = []
+    returns_ctrl = []
+    for ep in range(cfg.eval_episodes):
+        key = jax.random.PRNGKey(cfg.seed + 10000 + ep)
+        keys = jax.random.split(key, 1)
+        state = reset_fn(keys)
+        ep_ret = 0.0
+        ep_run = 0.0
+        ep_ctrl = 0.0
+        for _ in range(cfg.episode_length):
+            obs = state.obs
+            key, akey = jax.random.split(key)
+            action, _ = sample_action_fn(actor_params, obs, akey, deterministic=True)
+            state = step_fn(state, action)
+            ep_ret += float(jnp.asarray(state.reward)[0])
+
+            metrics = getattr(state, "metrics", None)
+            if metrics is not None:
+                run_val = metrics.get("reward_run", 0.0)
+                ctrl_val = metrics.get("reward_ctrl", 0.0)
+                ep_run += float(jnp.asarray(run_val)[0]) if hasattr(run_val, "shape") else float(run_val)
+                ep_ctrl += float(jnp.asarray(ctrl_val)[0]) if hasattr(ctrl_val, "shape") else float(ctrl_val)
+
+            if bool(jnp.asarray(state.done)[0]):
+                break
+        returns.append(ep_ret)
+        returns_run.append(ep_run)
+        returns_ctrl.append(ep_ctrl)
+
+    rewards = np.asarray(returns, dtype=np.float32)
+    rewards_run = np.asarray(returns_run, dtype=np.float32)
+    rewards_ctrl = np.asarray(returns_ctrl, dtype=np.float32)
+    return {
+        "episode_reward": float(np.mean(rewards)),
+        "episode_reward_run": float(np.mean(rewards_run)) if rewards_run.size > 0 else 0.0,
+        "episode_reward_ctrl": float(np.mean(rewards_ctrl)) if rewards_ctrl.size > 0 else 0.0,
+        "episode_reward_std": float(np.std(rewards)) if rewards.size > 0 else 0.0,
+    }
+
+
+def save_actor_params(path: str, actor_params, jax_module) -> None:
+    leaves = jax_module.tree_util.tree_leaves(actor_params)
+    arrays = {f"arr_{i}": np.asarray(jax_module.device_get(v)) for i, v in enumerate(leaves)}
+    np.savez(path, **arrays)
+
+
+def train(cfg: Config) -> None:
+    imported = try_import_jax_brax()
+    if imported is None:
+        return
+
+    nn, jax, jnp, optax, train_state, envs = imported
+
+    np.random.seed(cfg.seed)
+
+    env = envs.get_environment(env_name=cfg.env_name, backend=cfg.backend)
+
+    # Vectorized Brax stepping for parallel data collection.
+    reset_fn = jax.jit(jax.vmap(env.reset))
+    step_fn = jax.jit(jax.vmap(env.step))
+
+    @jax.jit
+    def step_collect_fn(curr_state, action, reset_keys):
+        # Step once and record transition from raw next state.
+        next_state_raw = step_fn(curr_state, action)
+        done = next_state_raw.done.astype(jnp.bool_)
+        not_done = 1.0 - next_state_raw.done.astype(jnp.float32)
+        transition = (curr_state.obs, action, next_state_raw.obs, next_state_raw.reward, not_done)
+
+        # Auto-reset done environments so subsequent collection does not stay in terminal states.
+        reset_state = reset_fn(reset_keys)
+
+        def merge_state(raw_val, reset_val):
+            if raw_val.ndim == 0:
+                return raw_val
+            mask = done.reshape((done.shape[0],) + (1,) * (raw_val.ndim - 1))
+            return jnp.where(mask, reset_val, raw_val)
+
+        next_state = jax.tree.map(merge_state, next_state_raw, reset_state)
+        return next_state, transition
+
+    key = jax.random.PRNGKey(cfg.seed)
+    key, reset_key = jax.random.split(key)
+    reset_keys = jax.random.split(reset_key, cfg.num_envs)
+    env_state = reset_fn(reset_keys)
+
+    obs0 = np.asarray(jax.device_get(env_state.obs))
+    obs_dim = int(obs0.shape[-1])
+    act_dim = int(env.action_size)
+    max_action = 1.0
+
+    actor_def, critic_def, dynamics_def = build_modules(nn, jnp, obs_dim, act_dim, cfg.hidden_dim)
+
+    init_obs = jnp.zeros((1, obs_dim), dtype=jnp.float32)
+    init_act = jnp.zeros((1, act_dim), dtype=jnp.float32)
+
+    key, actor_key, c1_key, c2_key = jax.random.split(key, 4)
+
+    actor_params = actor_def.init(actor_key, init_obs)
+    critic1_params = critic_def.init(c1_key, init_obs, init_act)
+    critic2_params = critic_def.init(c2_key, init_obs, init_act)
+
+    actor_tx = optax.chain(optax.clip_by_global_norm(cfg.grad_clip_norm), optax.adam(cfg.actor_lr))
+    critic_tx = optax.chain(optax.clip_by_global_norm(cfg.grad_clip_norm), optax.adam(cfg.critic_lr))
+    model_tx = optax.chain(optax.clip_by_global_norm(cfg.grad_clip_norm), optax.adam(cfg.model_lr))
+
+    actor_state = train_state.TrainState.create(
+        apply_fn=actor_def.apply,
+        params=actor_params,
+        tx=actor_tx,
+    )
+    critic1_state = train_state.TrainState.create(
+        apply_fn=critic_def.apply,
+        params=critic1_params,
+        tx=critic_tx,
+    )
+    critic2_state = train_state.TrainState.create(
+        apply_fn=critic_def.apply,
+        params=critic2_params,
+        tx=critic_tx,
+    )
+
+    # Target networks are initialized from online critics.
+    target_critic1_params = critic1_state.params
+    target_critic2_params = critic2_state.params
+
+    # Optimize log(alpha) for stability and positivity of alpha.
+    log_alpha = jnp.array(np.log(cfg.alpha_init), dtype=jnp.float32)
+    alpha_tx = optax.adam(cfg.alpha_lr)
+    alpha_opt_state = alpha_tx.init(log_alpha)
+
+    # Ensemble of dynamics models to reduce model bias.
+    model_states = []
+    for i in range(cfg.ensemble_size):
+        key, mkey = jax.random.split(key)
+        m_params = dynamics_def.init(mkey, init_obs, init_act)
+        m_state = train_state.TrainState.create(
+            apply_fn=dynamics_def.apply,
+            params=m_params,
+            tx=model_tx,
+        )
+        model_states.append(m_state)
+
+    sample_action_fn, sac_update_fn = make_sac_fns(
+        jax,
+        jnp,
+        optax,
+        actor_def,
+        critic_def,
+        max_action=max_action,
+        gamma=cfg.gamma,
+        target_entropy=-float(act_dim),
+        alpha_tx=alpha_tx,
+        log_alpha_min=cfg.log_alpha_min,
+        log_alpha_max=cfg.log_alpha_max,
+    )
+
+    @jax.jit
+    def sac_multi_update_fn(
+        actor_state,
+        critic1_state,
+        critic2_state,
+        target_critic1_params,
+        target_critic2_params,
+        log_alpha,
+        alpha_opt_state,
+        obs_batch,
+        act_batch,
+        rew_batch,
+        next_obs_batch,
+        not_done_batch,
+        key_batch,
+        tau,
+    ):
+        # Run multiple SAC updates in one JAX scan to reduce Python dispatch overhead.
+        def body(carry, xs):
+            (
+                a_state,
+                c1_state,
+                c2_state,
+                tc1_params,
+                tc2_params,
+                la,
+                a_opt_state,
+            ) = carry
+            obs, act, rew, next_obs, not_done, k = xs
+            batch = {
+                "obs": obs,
+                "act": act,
+                "rew": rew,
+                "next_obs": next_obs,
+                "not_done": not_done,
+            }
+            (
+                a_state,
+                c1_state,
+                c2_state,
+                tc1_params,
+                tc2_params,
+                la,
+                a_opt_state,
+                metrics,
+            ) = sac_update_fn(
+                a_state,
+                c1_state,
+                c2_state,
+                tc1_params,
+                tc2_params,
+                la,
+                a_opt_state,
+                batch,
+                tau,
+                k,
+            )
+            new_carry = (a_state, c1_state, c2_state, tc1_params, tc2_params, la, a_opt_state)
+            return new_carry, metrics
+
+        init_carry = (
+            actor_state,
+            critic1_state,
+            critic2_state,
+            target_critic1_params,
+            target_critic2_params,
+            log_alpha,
+            alpha_opt_state,
+        )
+        final_carry, metrics_seq = jax.lax.scan(
+            body,
+            init_carry,
+            (obs_batch, act_batch, rew_batch, next_obs_batch, not_done_batch, key_batch),
+        )
+        last_metrics = jax.tree.map(lambda x: x[-1], metrics_seq)
+        return (*final_carry, last_metrics)
+
+    train_model_fn, predict_model_fn = make_dynamics_fns(jax, jnp, optax, dynamics_def)
+
+    real_buffer = ReplayBuffer(cfg.real_buffer_size, obs_dim, act_dim)
+    model_buffer = ReplayBuffer(cfg.model_buffer_size, obs_dim, act_dim)
+    norm = RunningNorm(obs_dim + act_dim, obs_dim + 1)
+
+    total_steps = 0
+    update_budget = 0.0
+    last_log = 0
+    last_eval = 0
+    best_eval = -1e18
+    best_step = 0
+    os.makedirs("models", exist_ok=True)
+    best_actor_path = os.path.join("models", "mbpo_brax_best_actor.npz")
+    last_actor_path = os.path.join("models", "mbpo_brax_last_actor.npz")
+    history_steps = []
+    history_rewards = []
+    history_rewards_run = []
+    history_rewards_ctrl = []
+    history_rewards_std = []
+    start_time = time.time()
+
+    while total_steps < cfg.total_steps:
+        num_updates = 0
+        effective_real_ratio = cfg.real_ratio
+        rollout_keep_frac = 1.0
+        # Stage A: collect real transitions from Brax env.
+        if total_steps < cfg.start_steps:
+            act_jnp = jnp.asarray(
+                np.random.uniform(-1.0, 1.0, size=(cfg.num_envs, act_dim)).astype(np.float32)
+            )
+        else:
+            key, akey = jax.random.split(key)
+            act_jnp, _ = sample_action_fn(actor_state.params, env_state.obs, akey, deterministic=False)
+
+        key, step_reset_key = jax.random.split(key)
+        step_reset_keys = jax.random.split(step_reset_key, cfg.num_envs)
+        env_state, transition = step_collect_fn(env_state, act_jnp, step_reset_keys)
+        obs_np, act_np, next_obs_np, rew_np, not_done_np = jax.device_get(transition)
+        obs_np = np.asarray(obs_np, dtype=np.float32)
+        act_np = np.asarray(act_np, dtype=np.float32)
+        next_obs_np = np.asarray(next_obs_np, dtype=np.float32)
+        rew_np = np.asarray(rew_np, dtype=np.float32)
+        not_done_np = np.asarray(not_done_np, dtype=np.float32)
+
+        real_buffer.add_batch(obs_np, act_np, rew_np, next_obs_np, not_done_np)
+        total_steps += cfg.num_envs
+
+        model_loss_value = 0.0
+
+        if total_steps >= cfg.start_steps and real_buffer.size >= cfg.batch_size:
+            # Stage B: periodically refit dynamics ensemble on real data.
+            if total_steps % cfg.model_train_freq < cfg.num_envs:
+                data = real_buffer.all_data()
+                norm.update(data["obs"], data["act"], data["next_obs"], data["rew"])
+
+                in_mean = jnp.asarray(norm.in_mean)
+                in_std = jnp.asarray(norm.in_std)
+                out_mean = jnp.asarray(norm.out_mean)
+                out_std = jnp.asarray(norm.out_std)
+
+                losses = []
+                for _ in range(cfg.model_train_epochs):
+                    for m in range(cfg.ensemble_size):
+                        batch_np = real_buffer.sample(cfg.batch_size)
+                        batch_jnp = {k: jnp.asarray(v) for k, v in batch_np.items()}
+                        model_states[m], mloss = train_model_fn(
+                            model_states[m],
+                            batch_jnp,
+                            in_mean,
+                            in_std,
+                            out_mean,
+                            out_std,
+                        )
+                        losses.append(float(mloss))
+                if losses:
+                    model_loss_value = float(np.mean(np.asarray(losses, dtype=np.float32)))
+
+            if total_steps % cfg.model_rollout_freq < cfg.num_envs and real_buffer.size >= cfg.model_rollout_batch:
+                # Stage C: short-horizon synthetic rollouts from real states.
+                rollout_obs_jnp = jnp.asarray(real_buffer.sample_obs(cfg.model_rollout_batch))
+
+                in_mean = jnp.asarray(norm.in_mean)
+                in_std = jnp.asarray(norm.in_std)
+                out_mean = jnp.asarray(norm.out_mean)
+                out_std = jnp.asarray(norm.out_std)
+
+                for _ in range(cfg.model_rollout_horizon):
+                    key, rkey = jax.random.split(key)
+                    act_jnp, _ = sample_action_fn(actor_state.params, rollout_obs_jnp, rkey, deterministic=False)
+
+                    # Predict all ensemble outputs on device, then sample one model per sample.
+                    ens_next = []
+                    ens_rew = []
+                    for mi in range(cfg.ensemble_size):
+                        key, pkey = jax.random.split(key)
+                        pred_next, pred_rew = predict_model_fn(
+                            model_states[mi].params,
+                            rollout_obs_jnp,
+                            act_jnp,
+                            in_mean,
+                            in_std,
+                            out_mean,
+                            out_std,
+                            pkey,
+                        )
+                        ens_next.append(pred_next)
+                        ens_rew.append(pred_rew)
+
+                    ens_next = jnp.stack(ens_next, axis=0)
+                    ens_rew = jnp.stack(ens_rew, axis=0)
+
+                    key, idx_key = jax.random.split(key)
+                    model_idx = jax.random.randint(
+                        idx_key,
+                        (cfg.model_rollout_batch,),
+                        0,
+                        cfg.ensemble_size,
+                    )
+                    batch_idx = jnp.arange(cfg.model_rollout_batch)
+                    next_obs_pred_jnp = ens_next[model_idx, batch_idx, :]
+                    rew_pred_jnp = ens_rew[model_idx, batch_idx, :]
+                    disagreement_jnp = jnp.var(ens_next, axis=0).mean(axis=-1) + jnp.var(ens_rew, axis=0).squeeze(-1)
+
+                    rollout_obs_np, act_np, next_obs_pred, rew_pred, disagreement = jax.device_get(
+                        (rollout_obs_jnp, act_jnp, next_obs_pred_jnp, rew_pred_jnp, disagreement_jnp)
+                    )
+                    rollout_obs_np = np.asarray(rollout_obs_np, dtype=np.float32)
+                    act_np = np.asarray(act_np, dtype=np.float32)
+                    next_obs_pred = np.asarray(next_obs_pred, dtype=np.float32)
+                    rew_pred = np.asarray(rew_pred, dtype=np.float32)
+                    disagreement = np.asarray(disagreement, dtype=np.float32)
+
+                    keep_mask = np.ones((cfg.model_rollout_batch,), dtype=bool)
+                    if cfg.max_model_disagreement > 0.0:
+                        keep_mask &= disagreement <= cfg.max_model_disagreement
+
+                    if cfg.rollout_keep_ratio < 1.0:
+                        keep_k = max(1, int(cfg.model_rollout_batch * cfg.rollout_keep_ratio))
+                        low_unc_idx = np.argpartition(disagreement, keep_k - 1)[:keep_k]
+                        ratio_mask = np.zeros((cfg.model_rollout_batch,), dtype=bool)
+                        ratio_mask[low_unc_idx] = True
+                        keep_mask &= ratio_mask
+
+                    kept = int(np.sum(keep_mask))
+                    rollout_keep_frac = kept / float(cfg.model_rollout_batch)
+
+                    if kept > 0:
+                        not_done_model = np.ones((kept,), dtype=np.float32)
+                        model_buffer.add_batch(
+                            rollout_obs_np[keep_mask],
+                            act_np[keep_mask],
+                            rew_pred.squeeze(-1)[keep_mask],
+                            next_obs_pred[keep_mask],
+                            not_done_model,
+                        )
+                    rollout_obs_jnp = next_obs_pred_jnp
+
+            # Budgeted updates: accumulate by env steps and cap per iteration.
+            update_budget += cfg.updates_per_step * cfg.num_envs
+            num_updates = min(int(update_budget), cfg.max_sac_updates_per_iter)
+            update_budget -= float(num_updates)
+            metrics = {"actor": 0.0, "critic": 0.0, "alpha": float(np.exp(float(log_alpha)))}
+
+            # Stage D: SAC updates on mixed real/model mini-batches.
+            # real_ratio controls how much model data is used each update.
+            effective_real_ratio = 1.0 if total_steps < cfg.model_warmup_steps else cfg.real_ratio
+            real_bs = int(cfg.batch_size * effective_real_ratio)
+            model_bs = cfg.batch_size - real_bs
+            if real_buffer.size >= real_bs and (model_bs == 0 or model_buffer.size >= model_bs) and num_updates > 0:
+                obs_buf = np.empty((num_updates, cfg.batch_size, obs_dim), dtype=np.float32)
+                act_buf = np.empty((num_updates, cfg.batch_size, act_dim), dtype=np.float32)
+                rew_buf = np.empty((num_updates, cfg.batch_size, 1), dtype=np.float32)
+                next_obs_buf = np.empty((num_updates, cfg.batch_size, obs_dim), dtype=np.float32)
+                not_done_buf = np.empty((num_updates, cfg.batch_size, 1), dtype=np.float32)
+
+                for i in range(num_updates):
+                    rb = real_buffer.sample(real_bs)
+                    if model_bs > 0:
+                        mb = model_buffer.sample(model_bs)
+                        obs_buf[i] = np.concatenate([rb["obs"], mb["obs"]], axis=0)
+                        act_buf[i] = np.concatenate([rb["act"], mb["act"]], axis=0)
+                        rew_buf[i] = np.concatenate([rb["rew"], mb["rew"]], axis=0)
+                        next_obs_buf[i] = np.concatenate([rb["next_obs"], mb["next_obs"]], axis=0)
+                        not_done_buf[i] = np.concatenate([rb["not_done"], mb["not_done"]], axis=0)
+                    else:
+                        obs_buf[i] = rb["obs"]
+                        act_buf[i] = rb["act"]
+                        rew_buf[i] = rb["rew"]
+                        next_obs_buf[i] = rb["next_obs"]
+                        not_done_buf[i] = rb["not_done"]
+
+                key, scan_key = jax.random.split(key)
+                scan_keys = jax.random.split(scan_key, num_updates)
+
+                (
+                    actor_state,
+                    critic1_state,
+                    critic2_state,
+                    target_critic1_params,
+                    target_critic2_params,
+                    log_alpha,
+                    alpha_opt_state,
+                    m,
+                ) = sac_multi_update_fn(
+                    actor_state,
+                    critic1_state,
+                    critic2_state,
+                    target_critic1_params,
+                    target_critic2_params,
+                    log_alpha,
+                    alpha_opt_state,
+                    jnp.asarray(obs_buf),
+                    jnp.asarray(act_buf),
+                    jnp.asarray(rew_buf),
+                    jnp.asarray(next_obs_buf),
+                    jnp.asarray(not_done_buf),
+                    scan_keys,
+                    cfg.tau,
+                )
+
+                metrics = {
+                    "actor": float(m["actor"]),
+                    "critic": float(m["critic"]),
+                    "alpha": float(m["alpha"]),
+                }
+        else:
+            metrics = {"actor": 0.0, "critic": 0.0, "alpha": float(np.exp(float(log_alpha)))}
+
+        if total_steps - last_log >= cfg.log_every:
+            last_log = total_steps
+            sps = int(total_steps / max(time.time() - start_time, 1e-6))
+            print(
+                f"Step {total_steps:8d} | SPS {sps:6d} | "
+                f"Actor {metrics['actor']:.4f} | Critic {metrics['critic']:.4f} | "
+                f"Alpha {metrics['alpha']:.4f} | ModelLoss {model_loss_value:.4f} | "
+                f"Upd {num_updates:2d} | RealRatio {effective_real_ratio:.2f} | "
+                f"RollKeep {rollout_keep_frac:.2f}"
+            )
+
+        if total_steps - last_eval >= cfg.eval_every:
+            last_eval = total_steps
+            eval_metrics = evaluate_policy(
+                cfg,
+                env,
+                actor_state.params,
+                sample_action_fn,
+                reset_fn,
+                step_fn,
+                jax,
+                jnp,
+            )
+            eval_ret = float(eval_metrics["episode_reward"])
+            history_steps.append(total_steps)
+            history_rewards.append(eval_ret)
+            history_rewards_run.append(float(eval_metrics["episode_reward_run"]))
+            history_rewards_ctrl.append(float(eval_metrics["episode_reward_ctrl"]))
+            history_rewards_std.append(float(eval_metrics["episode_reward_std"]))
+
+            # Always keep latest evaluated checkpoint.
+            save_actor_params(last_actor_path, actor_state.params, jax)
+
+            if eval_ret > best_eval:
+                best_eval = eval_ret
+                best_step = total_steps
+                save_actor_params(best_actor_path, actor_state.params, jax)
+            print(
+                f"Eval @ {total_steps:8d} | EpisodeReward {eval_ret:8.2f} | "
+                f"Run {eval_metrics['episode_reward_run']:8.2f} | Ctrl {eval_metrics['episode_reward_ctrl']:8.2f} | "
+                f"Std {eval_metrics['episode_reward_std']:7.2f} | Best {best_eval:8.2f}"
+            )
+
+    if history_steps:
+        os.makedirs("plots", exist_ok=True)
+
+        def smooth_1d(values: np.ndarray, window: int) -> np.ndarray:
+            if window <= 1 or values.size < window:
+                return values
+            left = window // 2
+            right = window - 1 - left
+            padded = np.pad(values, (left, right), mode="edge")
+            kernel = np.ones((window,), dtype=np.float32) / float(window)
+            return np.convolve(padded, kernel, mode="valid")
+
+        rewards = np.array(history_rewards, dtype=np.float32)
+        rewards_run = np.array(history_rewards_run, dtype=np.float32)
+        rewards_ctrl = np.array(history_rewards_ctrl, dtype=np.float32)
+        rewards_std = np.array(history_rewards_std, dtype=np.float32)
+
+        smooth = smooth_1d(rewards, cfg.smooth_window)
+        smooth_run = smooth_1d(rewards_run, cfg.smooth_window)
+        smooth_ctrl = smooth_1d(rewards_ctrl, cfg.smooth_window)
+        smooth_std = smooth_1d(rewards_std, cfg.smooth_window)
+
+        best_idx = int(np.argmax(rewards))
+        best_step = history_steps[best_idx]
+        best_reward = float(rewards[best_idx])
+
+        fig, axes = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
+
+        axes[0].plot(history_steps, rewards, color="tab:blue", alpha=0.35, label="Episode Reward")
+        axes[0].plot(history_steps, smooth, color="tab:orange", label=f"Reward Smoothed({cfg.smooth_window})")
+        axes[0].scatter([best_step], [best_reward], color="tab:red", s=35, label=f"Best {best_reward:.1f}")
+        axes[0].set_title(f"JAX Brax MBPO Reward Curves ({cfg.env_name})")
+        axes[0].set_ylabel("Total Reward")
+        axes[0].grid(alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(history_steps, rewards_run, color="tab:green", alpha=0.35, label="Reward Run")
+        axes[1].plot(history_steps, smooth_run, color="tab:olive", label=f"Run Smoothed({cfg.smooth_window})")
+        axes[1].plot(history_steps, rewards_ctrl, color="tab:purple", alpha=0.35, label="Reward Ctrl")
+        axes[1].plot(history_steps, smooth_ctrl, color="tab:pink", label=f"Ctrl Smoothed({cfg.smooth_window})")
+        axes[1].plot(history_steps, smooth_std, color="tab:brown", label=f"Reward Std Smoothed({cfg.smooth_window})")
+        axes[1].set_xlabel("Environment Steps")
+        axes[1].set_ylabel("Run/Ctrl/Std")
+        axes[1].grid(alpha=0.3)
+        axes[1].legend(ncol=2)
+
+        out = os.path.join("plots", "mbpo_brax_reward.png")
+        fig.tight_layout()
+        fig.savefig(out, dpi=200)
+        plt.close(fig)
+        print(f"Saved training plot to: {out}")
+
+    # Model selection: prefer best checkpoint for downstream evaluation.
+    selected_actor_path = os.path.join("models", "mbpo_brax_actor_selected.npz")
+    if os.path.exists(best_actor_path):
+        shutil.copyfile(best_actor_path, selected_actor_path)
+    elif os.path.exists(last_actor_path):
+        shutil.copyfile(last_actor_path, selected_actor_path)
+
+    summary_path = os.path.join("models", "mbpo_brax_selection_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(f"best_actor={best_actor_path}\n")
+        f.write(f"last_actor={last_actor_path}\n")
+        f.write(f"selected_actor={selected_actor_path}\n")
+        f.write(f"best_eval={best_eval:.6f}\n")
+        f.write(f"best_step={best_step}\n")
+
+    print(f"Saved best actor: {best_actor_path}")
+    print(f"Saved last actor: {last_actor_path}")
+    print(f"Selected actor for evaluation: {selected_actor_path}")
+    print(f"Saved selection summary: {summary_path}")
+
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="MBPO (JAX + Brax)")
+    p.add_argument("--env", type=str, default="halfcheetah")
+    p.add_argument("--backend", type=str, default="spring", choices=["spring", "positional", "generalized"])
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--total_steps", type=int, default=20_000_000)
+    p.add_argument("--num_envs", type=int, default=64)
+    p.add_argument("--episode_length", type=int, default=1000)
+    p.add_argument("--start_steps", type=int, default=5000)
+    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--updates_per_step", type=float, default=0.25)
+    p.add_argument("--max_sac_updates_per_iter", type=int, default=8)
+    p.add_argument("--log_alpha_min", type=float, default=-3.0)
+    p.add_argument("--log_alpha_max", type=float, default=0.0)
+    p.add_argument("--grad_clip_norm", type=float, default=5.0)
+    p.add_argument("--model_train_freq", type=int, default=5000)
+    p.add_argument("--model_rollout_freq", type=int, default=5000)
+    p.add_argument("--model_rollout_horizon", type=int, default=2)
+    p.add_argument("--model_rollout_batch", type=int, default=2000)
+    p.add_argument("--rollout_keep_ratio", type=float, default=0.3)
+    p.add_argument("--max_model_disagreement", type=float, default=0.0)
+    p.add_argument("--real_ratio", type=float, default=0.9)
+    p.add_argument("--model_warmup_steps", type=int, default=300000)
+    p.add_argument("--eval_every", type=int, default=50000)
+    p.add_argument("--eval_episodes", type=int, default=1)
+    p.add_argument("--log_every", type=int, default=5000)
+    p.add_argument("--smooth_window", type=int, default=7)
+
+    args = p.parse_args()
+
+    cfg = Config()
+    cfg.env_name = args.env
+    cfg.backend = args.backend
+    cfg.seed = args.seed
+    cfg.total_steps = args.total_steps
+    cfg.num_envs = args.num_envs
+    cfg.episode_length = args.episode_length
+    cfg.start_steps = args.start_steps
+    cfg.batch_size = args.batch_size
+    cfg.updates_per_step = args.updates_per_step
+    cfg.max_sac_updates_per_iter = args.max_sac_updates_per_iter
+    cfg.log_alpha_min = args.log_alpha_min
+    cfg.log_alpha_max = args.log_alpha_max
+    cfg.grad_clip_norm = args.grad_clip_norm
+    cfg.model_train_freq = args.model_train_freq
+    cfg.model_rollout_freq = args.model_rollout_freq
+    cfg.model_rollout_horizon = args.model_rollout_horizon
+    cfg.model_rollout_batch = args.model_rollout_batch
+    cfg.rollout_keep_ratio = args.rollout_keep_ratio
+    cfg.max_model_disagreement = args.max_model_disagreement
+    cfg.real_ratio = args.real_ratio
+    cfg.model_warmup_steps = args.model_warmup_steps
+    cfg.eval_every = args.eval_every
+    cfg.eval_episodes = args.eval_episodes
+    cfg.log_every = args.log_every
+    cfg.smooth_window = args.smooth_window
+    return cfg
+
+
+if __name__ == "__main__":
+    train(parse_args())
