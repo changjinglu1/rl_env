@@ -37,6 +37,8 @@ class Config:
 
     total_steps: int = 20_000_000
     num_envs: int = 256
+    # Optional: shard environment collection across all local JAX devices.
+    multi_device: bool = False
     episode_length: int = 1000
 
     hidden_dim: int = 256
@@ -54,8 +56,8 @@ class Config:
     log_alpha_max: float = 0.0
 
     actor_lr: float = 1e-4
-    critic_lr: float = 1e-4
-    alpha_lr: float = 1e-4
+    critic_lr: float = 3e-4
+    alpha_lr: float = 3e-4
     model_lr: float = 1e-4
     grad_clip_norm: float = 5.0
 
@@ -464,38 +466,96 @@ def train(cfg: Config) -> None:
         return
 
     nn, jax, jnp, optax, train_state, envs = imported
+    local_devices = jax.local_device_count()
+    global_devices = jax.device_count()
+    use_multi_device = bool(cfg.multi_device and local_devices > 1)
+
+    print(f"JAX backend: {jax.default_backend()}")
+    print(f"JAX local devices ({local_devices}): {jax.local_devices()}")
+    print(f"JAX global device_count: {global_devices} | process_index: {jax.process_index()}")
+
+    if cfg.multi_device and local_devices <= 1:
+        print("multi_device=True but only one local JAX device found; falling back to single-device mode.")
+    if use_multi_device and (cfg.num_envs % local_devices != 0):
+        raise ValueError(
+            f"num_envs ({cfg.num_envs}) must be divisible by local_device_count ({local_devices}) in multi-device mode."
+        )
+    envs_per_device = cfg.num_envs // local_devices if use_multi_device else cfg.num_envs
+
+    print(
+        "Config | "
+        f"actor_lr={cfg.actor_lr:.2e} critic_lr={cfg.critic_lr:.2e} "
+        f"alpha_lr={cfg.alpha_lr:.2e} model_lr={cfg.model_lr:.2e} "
+        f"updates_per_step={cfg.updates_per_step:.3f} max_updates={cfg.max_sac_updates_per_iter} "
+        f"multi_device={use_multi_device} local_devices={local_devices} global_devices={global_devices}"
+    )
 
     np.random.seed(cfg.seed)
 
     env = envs.get_environment(env_name=cfg.env_name, backend=cfg.backend)
 
     # Vectorized Brax stepping for parallel data collection.
-    reset_fn = jax.jit(jax.vmap(env.reset))
-    step_fn = jax.jit(jax.vmap(env.step))
+    # In multi-device mode, we shard envs across devices with pmap(vmap).
+    eval_reset_fn = jax.jit(jax.vmap(env.reset))
+    eval_step_fn = jax.jit(jax.vmap(env.step))
+    if use_multi_device:
+        reset_fn = jax.jit(jax.pmap(jax.vmap(env.reset)))
+        step_fn = jax.jit(jax.pmap(jax.vmap(env.step)))
+    else:
+        reset_fn = eval_reset_fn
+        step_fn = eval_step_fn
 
-    @jax.jit
-    def step_collect_fn(curr_state, action, reset_keys):
-        # Step once and record transition from raw next state.
-        next_state_raw = step_fn(curr_state, action)
-        done = next_state_raw.done.astype(jnp.bool_)
-        not_done = 1.0 - next_state_raw.done.astype(jnp.float32)
-        transition = (curr_state.obs, action, next_state_raw.obs, next_state_raw.reward, not_done)
+    if use_multi_device:
+        def step_collect_fn(curr_state, action, reset_keys):
+            # Step once and record transition from raw next state.
+            next_state_raw = step_fn(curr_state, action)
+            done = next_state_raw.done.astype(jnp.bool_)
+            not_done = 1.0 - next_state_raw.done.astype(jnp.float32)
+            transition = (curr_state.obs, action, next_state_raw.obs, next_state_raw.reward, not_done)
 
-        # Auto-reset done environments so subsequent collection does not stay in terminal states.
-        reset_state = reset_fn(reset_keys)
+            # Auto-reset done environments so subsequent collection does not stay in terminal states.
+            reset_state = reset_fn(reset_keys)
 
-        def merge_state(raw_val, reset_val):
-            if raw_val.ndim == 0:
-                return raw_val
-            mask = done.reshape((done.shape[0],) + (1,) * (raw_val.ndim - 1))
-            return jnp.where(mask, reset_val, raw_val)
+            def merge_state(raw_val, reset_val):
+                if not hasattr(raw_val, "shape"):
+                    return raw_val
+                if raw_val.ndim < done.ndim:
+                    return raw_val
+                if raw_val.shape[: done.ndim] != done.shape:
+                    return raw_val
+                mask = done
+                while mask.ndim < raw_val.ndim:
+                    mask = mask[..., None]
+                return jnp.where(mask, reset_val, raw_val)
 
-        next_state = jax.tree.map(merge_state, next_state_raw, reset_state)
-        return next_state, transition
+            next_state = jax.tree.map(merge_state, next_state_raw, reset_state)
+            return next_state, transition
+    else:
+        @jax.jit
+        def step_collect_fn(curr_state, action, reset_keys):
+            # Step once and record transition from raw next state.
+            next_state_raw = step_fn(curr_state, action)
+            done = next_state_raw.done.astype(jnp.bool_)
+            not_done = 1.0 - next_state_raw.done.astype(jnp.float32)
+            transition = (curr_state.obs, action, next_state_raw.obs, next_state_raw.reward, not_done)
+
+            # Auto-reset done environments so subsequent collection does not stay in terminal states.
+            reset_state = reset_fn(reset_keys)
+
+            def merge_state(raw_val, reset_val):
+                if raw_val.ndim == 0:
+                    return raw_val
+                mask = done.reshape((done.shape[0],) + (1,) * (raw_val.ndim - 1))
+                return jnp.where(mask, reset_val, raw_val)
+
+            next_state = jax.tree.map(merge_state, next_state_raw, reset_state)
+            return next_state, transition
 
     key = jax.random.PRNGKey(cfg.seed)
     key, reset_key = jax.random.split(key)
     reset_keys = jax.random.split(reset_key, cfg.num_envs)
+    if use_multi_device:
+        reset_keys = reset_keys.reshape((local_devices, envs_per_device, 2))
     env_state = reset_fn(reset_keys)
 
     obs0 = np.asarray(jax.device_get(env_state.obs))
@@ -674,22 +734,38 @@ def train(cfg: Config) -> None:
         rollout_keep_frac = 1.0
         # Stage A: collect real transitions from Brax env.
         if total_steps < cfg.start_steps:
-            act_jnp = jnp.asarray(
-                np.random.uniform(-1.0, 1.0, size=(cfg.num_envs, act_dim)).astype(np.float32)
-            )
+            if use_multi_device:
+                act_shape = (local_devices, envs_per_device, act_dim)
+            else:
+                act_shape = (cfg.num_envs, act_dim)
+            act_jnp = jnp.asarray(np.random.uniform(-1.0, 1.0, size=act_shape).astype(np.float32))
         else:
             key, akey = jax.random.split(key)
             act_jnp, _ = sample_action_fn(actor_state.params, env_state.obs, akey, deterministic=False)
 
+        if use_multi_device and act_jnp.ndim == 2:
+            act_jnp = act_jnp.reshape((local_devices, envs_per_device, act_dim))
+
         key, step_reset_key = jax.random.split(key)
         step_reset_keys = jax.random.split(step_reset_key, cfg.num_envs)
+        if use_multi_device:
+            step_reset_keys = step_reset_keys.reshape((local_devices, envs_per_device, 2))
+            expected_prefix = (local_devices, envs_per_device)
+            obs_prefix = tuple(env_state.obs.shape[:2])
+            act_prefix = tuple(act_jnp.shape[:2])
+            key_prefix = tuple(step_reset_keys.shape[:2])
+            if obs_prefix != expected_prefix or act_prefix != expected_prefix or key_prefix != expected_prefix:
+                raise ValueError(
+                    "Multi-device batch shape mismatch before step_collect_fn: "
+                    f"expected={expected_prefix}, obs={obs_prefix}, act={act_prefix}, reset_keys={key_prefix}"
+                )
         env_state, transition = step_collect_fn(env_state, act_jnp, step_reset_keys)
         obs_np, act_np, next_obs_np, rew_np, not_done_np = jax.device_get(transition)
-        obs_np = np.asarray(obs_np, dtype=np.float32)
-        act_np = np.asarray(act_np, dtype=np.float32)
-        next_obs_np = np.asarray(next_obs_np, dtype=np.float32)
-        rew_np = np.asarray(rew_np, dtype=np.float32)
-        not_done_np = np.asarray(not_done_np, dtype=np.float32)
+        obs_np = np.asarray(obs_np, dtype=np.float32).reshape((-1, obs_dim))
+        act_np = np.asarray(act_np, dtype=np.float32).reshape((-1, act_dim))
+        next_obs_np = np.asarray(next_obs_np, dtype=np.float32).reshape((-1, obs_dim))
+        rew_np = np.asarray(rew_np, dtype=np.float32).reshape((-1,))
+        not_done_np = np.asarray(not_done_np, dtype=np.float32).reshape((-1,))
 
         real_buffer.add_batch(obs_np, act_np, rew_np, next_obs_np, not_done_np)
         total_steps += cfg.num_envs
@@ -893,8 +969,8 @@ def train(cfg: Config) -> None:
                 env,
                 actor_state.params,
                 sample_action_fn,
-                reset_fn,
-                step_fn,
+                eval_reset_fn,
+                eval_step_fn,
                 jax,
                 jnp,
             )
@@ -998,6 +1074,7 @@ def parse_args() -> Config:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--total_steps", type=int, default=20_000_000)
     p.add_argument("--num_envs", type=int, default=64)
+    p.add_argument("--multi_device", action="store_true")
     p.add_argument("--episode_length", type=int, default=1000)
     p.add_argument("--start_steps", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=256)
@@ -1005,6 +1082,10 @@ def parse_args() -> Config:
     p.add_argument("--max_sac_updates_per_iter", type=int, default=8)
     p.add_argument("--log_alpha_min", type=float, default=-3.0)
     p.add_argument("--log_alpha_max", type=float, default=0.0)
+    p.add_argument("--actor_lr", type=float, default=1e-4)
+    p.add_argument("--critic_lr", type=float, default=3e-4)
+    p.add_argument("--alpha_lr", type=float, default=3e-4)
+    p.add_argument("--model_lr", type=float, default=1e-4)
     p.add_argument("--grad_clip_norm", type=float, default=5.0)
     p.add_argument("--model_train_freq", type=int, default=5000)
     p.add_argument("--model_rollout_freq", type=int, default=5000)
@@ -1027,6 +1108,7 @@ def parse_args() -> Config:
     cfg.seed = args.seed
     cfg.total_steps = args.total_steps
     cfg.num_envs = args.num_envs
+    cfg.multi_device = args.multi_device
     cfg.episode_length = args.episode_length
     cfg.start_steps = args.start_steps
     cfg.batch_size = args.batch_size
@@ -1034,6 +1116,10 @@ def parse_args() -> Config:
     cfg.max_sac_updates_per_iter = args.max_sac_updates_per_iter
     cfg.log_alpha_min = args.log_alpha_min
     cfg.log_alpha_max = args.log_alpha_max
+    cfg.actor_lr = args.actor_lr
+    cfg.critic_lr = args.critic_lr
+    cfg.alpha_lr = args.alpha_lr
+    cfg.model_lr = args.model_lr
     cfg.grad_clip_norm = args.grad_clip_norm
     cfg.model_train_freq = args.model_train_freq
     cfg.model_rollout_freq = args.model_rollout_freq
