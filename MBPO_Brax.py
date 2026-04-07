@@ -35,54 +35,67 @@ class Config:
     backend: str = "spring"
     seed: int = 42
 
-    total_steps: int = 20_000_000
-    num_envs: int = 256
+    total_steps: int = 10_000_000
+    num_envs: int = 512
     # Optional: shard environment collection across all local JAX devices.
     multi_device: bool = False
+    # Optional: parallelize SAC learner (Stage D) across local devices.
+    parallel_learner: bool = False
     episode_length: int = 1000
 
     hidden_dim: int = 256
     gamma: float = 0.99
     tau: float = 0.005
     batch_size: int = 256
-    start_steps: int = 5_000
+    start_steps: int = 10_000
     # Gradient updates per environment step (can be fractional).
-    updates_per_step: float = 0.25
+    updates_per_step: float = 0.15
     # Hard cap to avoid very slow iterations when num_envs is large.
-    max_sac_updates_per_iter: int = 8
+    max_sac_updates_per_iter: int = 64
     # Prevent entropy temperature from collapsing too far.
-    log_alpha_min: float = -3.0
+    log_alpha_min: float = -8.0
     # Also cap alpha from growing too large.
-    log_alpha_max: float = 0.0
+    log_alpha_max: float = 2.0
 
-    actor_lr: float = 1e-4
+    actor_lr: float = 3e-4
     critic_lr: float = 3e-4
-    alpha_lr: float = 3e-4
-    model_lr: float = 1e-4
+    alpha_lr: float = 5e-5
+    model_lr: float = 3e-4
     grad_clip_norm: float = 5.0
 
     alpha_init: float = 0.2
 
     real_buffer_size: int = 1_000_000
     model_buffer_size: int = 800_000
-    real_ratio: float = 0.9 # 每次 SAC 更新时，real_ratio 控制了从真实环境数据和模型生成数据中采样的比例。
-    # Before this step, SAC updates use only real data to avoid early model bias.
+    # SAC updates start with only real data, then gradually mix in more model data.
+    real_ratio: float = 0.9
     model_warmup_steps: int = 300_000
+    # After model warmup, decay real_ratio from 1.0 to `real_ratio` over this many env steps.
+    real_ratio_ramp_steps: int = 3_000_000
 
     ensemble_size: int = 8
-    model_train_epochs: int = 5
-    model_train_batches: int = 200
-    model_train_freq: int = 5_000
+    model_train_epochs: int = 10
+    model_train_freq: int = 500
     model_rollout_freq: int = 5_000
     model_rollout_batch: int = 2_000
-    model_rollout_horizon: int = 2
+    # Rollout horizon starts small and grows toward model_rollout_horizon.
+    model_rollout_horizon_min: int = 1
+    model_rollout_horizon: int = 1
+    model_rollout_ramp_steps: int = 1_000_000
+    # Require a few model updates before allowing the horizon to grow.
+    model_rollout_quality_warmup_updates: int = 3
+    # Power > 1 makes rollout horizon growth slower early on.
+    model_rollout_growth_power: float = 2.0
     # Keep only the lowest-uncertainty synthetic transitions.
     rollout_keep_ratio: float = 0.3
     # Optional hard threshold on ensemble disagreement (0 disables threshold).
     max_model_disagreement: float = 0.0
 
-    eval_every: int = 50_000
-    eval_episodes: int = 1
+    eval_every: int = 200_000
+    # Number of parallel environments used only during evaluation.
+    eval_num_envs: int = 128
+    eval_episodes: int = 3
+    eval_episode_length: int = 500
     log_every: int = 5_000
     smooth_window: int = 7
 
@@ -237,8 +250,9 @@ def make_sac_fns(
     alpha_tx,
     log_alpha_min: float,
     log_alpha_max: float,
+    axis_name: str | None = None,
 ):
-    log_2pi = np.log(2.0 * np.pi).astype(np.float32)
+    log_2pi = jnp.log(2.0 * jnp.pi).astype(jnp.float32)
 
     def sample_action(actor_params, obs, key, deterministic: bool):
         # Tanh-Gaussian policy: sample pre_tanh action then squash to [-1, 1].
@@ -298,6 +312,11 @@ def make_sac_fns(
             critic_loss_fn, argnums=(0, 1)
         )(critic1_state.params, critic2_state.params)
 
+        if axis_name is not None:
+            critic1_grads = jax.lax.pmean(critic1_grads, axis_name=axis_name)
+            critic2_grads = jax.lax.pmean(critic2_grads, axis_name=axis_name)
+            critic_loss = jax.lax.pmean(critic_loss, axis_name=axis_name)
+
         critic1_state = critic1_state.apply_gradients(grads=critic1_grads)
         critic2_state = critic2_state.apply_gradients(grads=critic2_grads)
 
@@ -309,6 +328,10 @@ def make_sac_fns(
             return (alpha * logp - q_pi).mean(), logp
 
         (actor_loss, logp), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params)
+        if axis_name is not None:
+            actor_grads = jax.lax.pmean(actor_grads, axis_name=axis_name)
+            actor_loss = jax.lax.pmean(actor_loss, axis_name=axis_name)
+            logp = jax.lax.pmean(logp, axis_name=axis_name)
         actor_state = actor_state.apply_gradients(grads=actor_grads)
 
         def alpha_loss_fn(log_alpha_val):
@@ -317,6 +340,9 @@ def make_sac_fns(
             return -(log_alpha_val * entropy_term.mean())
 
         alpha_loss, alpha_grad = jax.value_and_grad(alpha_loss_fn)(log_alpha)
+        if axis_name is not None:
+            alpha_grad = jax.lax.pmean(alpha_grad, axis_name=axis_name)
+            alpha_loss = jax.lax.pmean(alpha_loss, axis_name=axis_name)
         alpha_updates, alpha_opt_state = alpha_tx.update(alpha_grad, alpha_opt_state)
         log_alpha = optax.apply_updates(log_alpha, alpha_updates)
         log_alpha = jnp.clip(log_alpha, log_alpha_min, log_alpha_max)
@@ -412,40 +438,65 @@ def evaluate_policy(
     jax,
     jnp,
 ) -> dict[str, float]:
-    # Deterministic actor evaluation on one environment instance.
-    returns = []
-    returns_run = []
-    returns_ctrl = []
+    # Fast deterministic evaluation: vectorized envs + scan over time, with done-masking.
+    eval_envs = max(1, int(cfg.eval_num_envs))
+
+    @jax.jit
+    def rollout_once(eval_key):
+        reset_keys = jax.random.split(eval_key, eval_envs)
+        init_state = reset_fn(reset_keys)
+        init_done = jnp.zeros((eval_envs,), dtype=jnp.bool_)
+        init_ret = jnp.zeros((eval_envs,), dtype=jnp.float32)
+        init_run = jnp.zeros((eval_envs,), dtype=jnp.float32)
+        init_ctrl = jnp.zeros((eval_envs,), dtype=jnp.float32)
+
+        def scan_body(carry, _):
+            state, done_mask, ep_ret, ep_run, ep_ctrl, key = carry
+            key, eval_key = jax.random.split(key)
+            action, _ = sample_action_fn(actor_params, state.obs, eval_key, deterministic=True)
+            next_state = step_fn(state, action)
+
+            alive = (~done_mask).astype(jnp.float32)
+            reward = next_state.reward.astype(jnp.float32)
+            ep_ret = ep_ret + reward * alive
+
+            metrics = getattr(next_state, "metrics", None)
+            if metrics is not None:
+                run_val = jnp.asarray(metrics.get("reward_run", jnp.zeros_like(reward)), dtype=jnp.float32)
+                ctrl_val = jnp.asarray(metrics.get("reward_ctrl", jnp.zeros_like(reward)), dtype=jnp.float32)
+            else:
+                run_val = jnp.zeros_like(reward)
+                ctrl_val = jnp.zeros_like(reward)
+
+            ep_run = ep_run + run_val * alive
+            ep_ctrl = ep_ctrl + ctrl_val * alive
+            done_mask = jnp.logical_or(done_mask, next_state.done.astype(jnp.bool_))
+            return (next_state, done_mask, ep_ret, ep_run, ep_ctrl, key), None
+        
+
+        init_key = eval_key
+        (final_state, final_done, ep_ret, ep_run, ep_ctrl, _), _ = jax.lax.scan(
+            scan_body,
+            (init_state, init_done, init_ret, init_run, init_ctrl, init_key),
+            xs=None,
+            length=cfg.eval_episode_length,
+        )
+        del final_state, final_done
+        return ep_ret, ep_run, ep_ctrl
+
+    rewards_all = []
+    run_all = []
+    ctrl_all = []
     for ep in range(cfg.eval_episodes):
         key = jax.random.PRNGKey(cfg.seed + 10000 + ep)
-        keys = jax.random.split(key, 1)
-        state = reset_fn(keys)
-        ep_ret = 0.0
-        ep_run = 0.0
-        ep_ctrl = 0.0
-        for _ in range(cfg.episode_length):
-            obs = state.obs
-            key, akey = jax.random.split(key)
-            action, _ = sample_action_fn(actor_params, obs, akey, deterministic=True)
-            state = step_fn(state, action)
-            ep_ret += float(jnp.asarray(state.reward)[0])
+        ep_ret, ep_run, ep_ctrl = rollout_once(key)
+        rewards_all.append(np.asarray(jax.device_get(ep_ret), dtype=np.float32))
+        run_all.append(np.asarray(jax.device_get(ep_run), dtype=np.float32))
+        ctrl_all.append(np.asarray(jax.device_get(ep_ctrl), dtype=np.float32))
 
-            metrics = getattr(state, "metrics", None)
-            if metrics is not None:
-                run_val = metrics.get("reward_run", 0.0)
-                ctrl_val = metrics.get("reward_ctrl", 0.0)
-                ep_run += float(jnp.asarray(run_val)[0]) if hasattr(run_val, "shape") else float(run_val)
-                ep_ctrl += float(jnp.asarray(ctrl_val)[0]) if hasattr(ctrl_val, "shape") else float(ctrl_val)
-
-            if bool(jnp.asarray(state.done)[0]):
-                break
-        returns.append(ep_ret)
-        returns_run.append(ep_run)
-        returns_ctrl.append(ep_ctrl)
-
-    rewards = np.asarray(returns, dtype=np.float32)
-    rewards_run = np.asarray(returns_run, dtype=np.float32)
-    rewards_ctrl = np.asarray(returns_ctrl, dtype=np.float32)
+    rewards = np.concatenate(rewards_all, axis=0) if rewards_all else np.zeros((0,), dtype=np.float32)
+    rewards_run = np.concatenate(run_all, axis=0) if run_all else np.zeros((0,), dtype=np.float32)
+    rewards_ctrl = np.concatenate(ctrl_all, axis=0) if ctrl_all else np.zeros((0,), dtype=np.float32)
     return {
         "episode_reward": float(np.mean(rewards)),
         "episode_reward_run": float(np.mean(rewards_run)) if rewards_run.size > 0 else 0.0,
@@ -469,6 +520,7 @@ def train(cfg: Config) -> None:
     local_devices = jax.local_device_count()
     global_devices = jax.device_count()
     use_multi_device = bool(cfg.multi_device and local_devices > 1)
+    use_parallel_learner = bool(cfg.parallel_learner and use_multi_device)
 
     print(f"JAX backend: {jax.default_backend()}")
     print(f"JAX local devices ({local_devices}): {jax.local_devices()}")
@@ -476,9 +528,15 @@ def train(cfg: Config) -> None:
 
     if cfg.multi_device and local_devices <= 1:
         print("multi_device=True but only one local JAX device found; falling back to single-device mode.")
+    if cfg.parallel_learner and not use_multi_device:
+        print("parallel_learner=True but multi_device collection is not active; falling back to single-device learner.")
     if use_multi_device and (cfg.num_envs % local_devices != 0):
         raise ValueError(
             f"num_envs ({cfg.num_envs}) must be divisible by local_device_count ({local_devices}) in multi-device mode."
+        )
+    if use_parallel_learner and (cfg.batch_size % local_devices != 0):
+        raise ValueError(
+            f"batch_size ({cfg.batch_size}) must be divisible by local_device_count ({local_devices}) in parallel learner mode."
         )
     envs_per_device = cfg.num_envs // local_devices if use_multi_device else cfg.num_envs
 
@@ -487,7 +545,8 @@ def train(cfg: Config) -> None:
         f"actor_lr={cfg.actor_lr:.2e} critic_lr={cfg.critic_lr:.2e} "
         f"alpha_lr={cfg.alpha_lr:.2e} model_lr={cfg.model_lr:.2e} "
         f"updates_per_step={cfg.updates_per_step:.3f} max_updates={cfg.max_sac_updates_per_iter} "
-        f"multi_device={use_multi_device} local_devices={local_devices} global_devices={global_devices}"
+        f"multi_device={use_multi_device} parallel_learner={use_parallel_learner} "
+        f"local_devices={local_devices} global_devices={global_devices}"
     )
 
     np.random.seed(cfg.seed)
@@ -562,6 +621,7 @@ def train(cfg: Config) -> None:
     obs_dim = int(obs0.shape[-1])
     act_dim = int(env.action_size)
     max_action = 1.0
+    print("obs_dim", obs_dim, "act_dim", act_dim, "num_envs", cfg.num_envs) #debug
 
     actor_def, critic_def, dynamics_def = build_modules(nn, jnp, obs_dim, act_dim, cfg.hidden_dim)
 
@@ -628,6 +688,27 @@ def train(cfg: Config) -> None:
         log_alpha_min=cfg.log_alpha_min,
         log_alpha_max=cfg.log_alpha_max,
     )
+
+    if use_parallel_learner:
+        _, sac_update_parallel_base_fn = make_sac_fns(
+            jax,
+            jnp,
+            optax,
+            actor_def,
+            critic_def,
+            max_action=max_action,
+            gamma=cfg.gamma,
+            target_entropy=-float(act_dim),
+            alpha_tx=alpha_tx,
+            log_alpha_min=cfg.log_alpha_min,
+            log_alpha_max=cfg.log_alpha_max,
+            axis_name="devices",
+        )
+        sac_update_parallel_fn = jax.pmap(
+            sac_update_parallel_base_fn,
+            axis_name="devices",
+            in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None, 0),
+        )
 
     @jax.jit
     def sac_multi_update_fn(
@@ -703,10 +784,38 @@ def train(cfg: Config) -> None:
             init_carry,
             (obs_batch, act_batch, rew_batch, next_obs_batch, not_done_batch, key_batch),
         )
-        last_metrics = jax.tree.map(lambda x: x[-1], metrics_seq)
+        last_metrics = jax.tree.map(lambda arr: arr[-1], metrics_seq)
         return (*final_carry, last_metrics)
 
     train_model_fn, predict_model_fn = make_dynamics_fns(jax, jnp, optax, dynamics_def)
+
+    if use_parallel_learner:
+        device_list = jax.local_devices()
+
+        def replicate_tree(x):
+            return jax.device_put_replicated(x, device_list)
+
+        actor_state = replicate_tree(actor_state)
+        critic1_state = replicate_tree(critic1_state)
+        critic2_state = replicate_tree(critic2_state)
+        target_critic1_params = replicate_tree(target_critic1_params)
+        target_critic2_params = replicate_tree(target_critic2_params)
+        log_alpha = replicate_tree(log_alpha)
+        alpha_opt_state = replicate_tree(alpha_opt_state)
+
+    def single_replica(tree):
+        if use_parallel_learner:
+            return jax.tree.map(lambda x: x[0], tree)
+        return tree
+
+    def current_actor_params():
+        return single_replica(actor_state.params)
+
+    def current_alpha_value() -> float:
+        if use_parallel_learner:
+            la0 = jax.device_get(log_alpha[0])
+            return float(np.exp(float(la0)))
+        return float(np.exp(float(log_alpha)))
 
     real_buffer = ReplayBuffer(cfg.real_buffer_size, obs_dim, act_dim)
     model_buffer = ReplayBuffer(cfg.model_buffer_size, obs_dim, act_dim)
@@ -718,6 +827,12 @@ def train(cfg: Config) -> None:
     last_eval = 0
     best_eval = -1e18
     best_step = 0
+    model_loss_ema = None
+    model_loss_baseline = None
+    model_loss_updates = 0
+    rollout_disagreement_ema = None
+    rollout_disagreement_baseline = None
+    rollout_disagreement_updates = 0
     os.makedirs("models", exist_ok=True)
     best_actor_path = os.path.join("models", "mbpo_brax_best_actor.npz")
     last_actor_path = os.path.join("models", "mbpo_brax_last_actor.npz")
@@ -727,11 +842,63 @@ def train(cfg: Config) -> None:
     history_rewards_ctrl = []
     history_rewards_std = []
     start_time = time.time()
+    debug_every_steps = max(int(cfg.log_every), int(cfg.num_envs))
+    last_real_write_debug_step = -debug_every_steps
+    # Use elapsed-step triggers so frequency is stable even when num_envs >= freq.
+    last_model_train_step = -int(cfg.model_train_freq)
+    last_model_rollout_step = -int(cfg.model_rollout_freq)
+
+    def current_rollout_horizon() -> int:
+        min_h = max(1, int(cfg.model_rollout_horizon_min))
+        max_h = max(min_h, int(cfg.model_rollout_horizon))
+        if total_steps < cfg.model_warmup_steps:
+            return min_h
+        if (
+            model_loss_updates < cfg.model_rollout_quality_warmup_updates
+            or rollout_disagreement_updates < cfg.model_rollout_quality_warmup_updates
+        ):
+            return min_h
+
+        ramp = max(1, int(cfg.model_rollout_ramp_steps))
+        step_progress = float(np.clip((total_steps - cfg.model_warmup_steps) / float(ramp), 0.0, 1.0))
+        step_progress = float(np.clip(step_progress ** float(cfg.model_rollout_growth_power), 0.0, 1.0))
+        step_h = min_h + int(round(step_progress * float(max_h - min_h)))
+
+        quality_terms = []
+        if model_loss_ema is not None and model_loss_baseline is not None:
+            # Use relative improvement so negative losses do not break the scale.
+            loss_scale = max(abs(float(model_loss_baseline)), 1e-6)
+            loss_score = (float(model_loss_baseline) - float(model_loss_ema)) / loss_scale
+            quality_terms.append(float(np.clip(loss_score, 0.0, 1.0)))
+        if rollout_disagreement_ema is not None and rollout_disagreement_baseline is not None:
+            dis_scale = max(abs(float(rollout_disagreement_baseline)), 1e-6)
+            dis_score = (float(rollout_disagreement_baseline) - float(rollout_disagreement_ema)) / dis_scale
+            quality_terms.append(float(np.clip(dis_score, 0.0, 1.0)))
+
+        if quality_terms:
+            quality = float(np.mean(quality_terms))
+            quality_h = min_h + int(round(quality * float(max_h - min_h)))
+            return max(min_h, min(max_h, min(step_h, quality_h)))
+        return step_h
+
+    def current_real_ratio() -> float:
+        if total_steps < cfg.model_warmup_steps:
+            return 1.0
+
+        start_ratio = 1.0
+        end_ratio = float(np.clip(cfg.real_ratio, 0.0, 1.0))
+        if end_ratio >= start_ratio:
+            return start_ratio
+
+        ramp = max(1, int(cfg.real_ratio_ramp_steps))
+        progress = float(np.clip((total_steps - cfg.model_warmup_steps) / float(ramp), 0.0, 1.0))
+        return float(start_ratio + progress * (end_ratio - start_ratio))
 
     while total_steps < cfg.total_steps:
         num_updates = 0
-        effective_real_ratio = cfg.real_ratio
-        rollout_keep_frac = 1.0
+        effective_real_ratio = current_real_ratio()
+        rollout_keep_frac: float | None = None
+        rollout_horizon_now = current_rollout_horizon()
         # Stage A: collect real transitions from Brax env.
         if total_steps < cfg.start_steps:
             if use_multi_device:
@@ -741,7 +908,7 @@ def train(cfg: Config) -> None:
             act_jnp = jnp.asarray(np.random.uniform(-1.0, 1.0, size=act_shape).astype(np.float32))
         else:
             key, akey = jax.random.split(key)
-            act_jnp, _ = sample_action_fn(actor_state.params, env_state.obs, akey, deterministic=False)
+            act_jnp, _ = sample_action_fn(current_actor_params(), env_state.obs, akey, deterministic=False)
 
         if use_multi_device and act_jnp.ndim == 2:
             act_jnp = act_jnp.reshape((local_devices, envs_per_device, act_dim))
@@ -767,6 +934,16 @@ def train(cfg: Config) -> None:
         rew_np = np.asarray(rew_np, dtype=np.float32).reshape((-1,))
         not_done_np = np.asarray(not_done_np, dtype=np.float32).reshape((-1,))
 
+        if total_steps - last_real_write_debug_step >= debug_every_steps:
+            print(
+                "Adding real batch before write: obs mean/std",
+                float(obs_np.mean()),
+                float(obs_np.std()),
+                "act mean/std",
+                float(act_np.mean()),
+                float(act_np.std()),
+            )
+            last_real_write_debug_step = total_steps
         real_buffer.add_batch(obs_np, act_np, rew_np, next_obs_np, not_done_np)
         total_steps += cfg.num_envs
 
@@ -774,7 +951,8 @@ def train(cfg: Config) -> None:
 
         if total_steps >= cfg.start_steps and real_buffer.size >= cfg.batch_size:
             # Stage B: periodically refit dynamics ensemble on real data.
-            if total_steps % cfg.model_train_freq < cfg.num_envs:
+            if (total_steps - last_model_train_step) >= int(cfg.model_train_freq):
+                last_model_train_step = total_steps
                 data = real_buffer.all_data()
                 norm.update(data["obs"], data["act"], data["next_obs"], data["rew"])
 
@@ -799,8 +977,18 @@ def train(cfg: Config) -> None:
                         losses.append(float(mloss))
                 if losses:
                     model_loss_value = float(np.mean(np.asarray(losses, dtype=np.float32)))
+                    model_loss_ema = (
+                        model_loss_value if model_loss_ema is None else 0.9 * model_loss_ema + 0.1 * model_loss_value
+                    )
+                    if model_loss_baseline is None:
+                        model_loss_baseline = model_loss_ema
+                    model_loss_updates += 1
 
-            if total_steps % cfg.model_rollout_freq < cfg.num_envs and real_buffer.size >= cfg.model_rollout_batch:
+            if (
+                (total_steps - last_model_rollout_step) >= int(cfg.model_rollout_freq)
+                and real_buffer.size >= cfg.model_rollout_batch
+            ):
+                last_model_rollout_step = total_steps
                 # Stage C: short-horizon synthetic rollouts from real states.
                 rollout_obs_jnp = jnp.asarray(real_buffer.sample_obs(cfg.model_rollout_batch))
 
@@ -809,9 +997,9 @@ def train(cfg: Config) -> None:
                 out_mean = jnp.asarray(norm.out_mean)
                 out_std = jnp.asarray(norm.out_std)
 
-                for _ in range(cfg.model_rollout_horizon):
+                for _ in range(rollout_horizon_now):
                     key, rkey = jax.random.split(key)
-                    act_jnp, _ = sample_action_fn(actor_state.params, rollout_obs_jnp, rkey, deterministic=False)
+                    act_jnp, _ = sample_action_fn(current_actor_params(), rollout_obs_jnp, rkey, deterministic=False)
 
                     # Predict all ensemble outputs on device, then sample one model per sample.
                     ens_next = []
@@ -854,6 +1042,15 @@ def train(cfg: Config) -> None:
                     next_obs_pred = np.asarray(next_obs_pred, dtype=np.float32)
                     rew_pred = np.asarray(rew_pred, dtype=np.float32)
                     disagreement = np.asarray(disagreement, dtype=np.float32)
+                    rollout_disagreement_value = float(np.mean(disagreement))
+                    rollout_disagreement_ema = (
+                        rollout_disagreement_value
+                        if rollout_disagreement_ema is None
+                        else 0.9 * rollout_disagreement_ema + 0.1 * rollout_disagreement_value
+                    )
+                    if rollout_disagreement_baseline is None:
+                        rollout_disagreement_baseline = rollout_disagreement_ema
+                    rollout_disagreement_updates += 1
 
                     keep_mask = np.ones((cfg.model_rollout_batch,), dtype=bool)
                     if cfg.max_model_disagreement > 0.0:
@@ -884,11 +1081,11 @@ def train(cfg: Config) -> None:
             update_budget += cfg.updates_per_step * cfg.num_envs
             num_updates = min(int(update_budget), cfg.max_sac_updates_per_iter)
             update_budget -= float(num_updates)
-            metrics = {"actor": 0.0, "critic": 0.0, "alpha": float(np.exp(float(log_alpha)))}
+            metrics = {"actor": 0.0, "critic": 0.0, "alpha": current_alpha_value()}
 
             # Stage D: SAC updates on mixed real/model mini-batches.
             # real_ratio controls how much model data is used each update.
-            effective_real_ratio = 1.0 if total_steps < cfg.model_warmup_steps else cfg.real_ratio
+            effective_real_ratio = current_real_ratio()
             real_bs = int(cfg.batch_size * effective_real_ratio)
             model_bs = cfg.batch_size - real_bs
             if real_buffer.size >= real_bs and (model_bs == 0 or model_buffer.size >= model_bs) and num_updates > 0:
@@ -914,52 +1111,99 @@ def train(cfg: Config) -> None:
                         next_obs_buf[i] = rb["next_obs"]
                         not_done_buf[i] = rb["not_done"]
 
-                key, scan_key = jax.random.split(key)
-                scan_keys = jax.random.split(scan_key, num_updates)
+                if use_parallel_learner:
+                    per_device_bs = cfg.batch_size // local_devices
+                    m_last = None
+                    for i in range(num_updates):
+                        obs_i = jnp.asarray(obs_buf[i].reshape(local_devices, per_device_bs, obs_dim))
+                        act_i = jnp.asarray(act_buf[i].reshape(local_devices, per_device_bs, act_dim))
+                        rew_i = jnp.asarray(rew_buf[i].reshape(local_devices, per_device_bs, 1))
+                        next_obs_i = jnp.asarray(next_obs_buf[i].reshape(local_devices, per_device_bs, obs_dim))
+                        not_done_i = jnp.asarray(not_done_buf[i].reshape(local_devices, per_device_bs, 1))
+                        batch_i = {
+                            "obs": obs_i,
+                            "act": act_i,
+                            "rew": rew_i,
+                            "next_obs": next_obs_i,
+                            "not_done": not_done_i,
+                        }
+                        key, update_key = jax.random.split(key)
+                        device_keys = jax.random.split(update_key, local_devices)
+                        (
+                            actor_state,
+                            critic1_state,
+                            critic2_state,
+                            target_critic1_params,
+                            target_critic2_params,
+                            log_alpha,
+                            alpha_opt_state,
+                            m_last,
+                        ) = sac_update_parallel_fn(
+                            actor_state,
+                            critic1_state,
+                            critic2_state,
+                            target_critic1_params,
+                            target_critic2_params,
+                            log_alpha,
+                            alpha_opt_state,
+                            batch_i,
+                            cfg.tau,
+                            device_keys,
+                        )
+                    metrics = {
+                        "actor": float(jax.device_get(m_last["actor"][0])),
+                        "critic": float(jax.device_get(m_last["critic"][0])),
+                        "alpha": float(jax.device_get(m_last["alpha"][0])),
+                    }
+                else:
+                    key, scan_key = jax.random.split(key)
+                    scan_keys = jax.random.split(scan_key, num_updates)
 
-                (
-                    actor_state,
-                    critic1_state,
-                    critic2_state,
-                    target_critic1_params,
-                    target_critic2_params,
-                    log_alpha,
-                    alpha_opt_state,
-                    m,
-                ) = sac_multi_update_fn(
-                    actor_state,
-                    critic1_state,
-                    critic2_state,
-                    target_critic1_params,
-                    target_critic2_params,
-                    log_alpha,
-                    alpha_opt_state,
-                    jnp.asarray(obs_buf),
-                    jnp.asarray(act_buf),
-                    jnp.asarray(rew_buf),
-                    jnp.asarray(next_obs_buf),
-                    jnp.asarray(not_done_buf),
-                    scan_keys,
-                    cfg.tau,
-                )
+                    (
+                        actor_state,
+                        critic1_state,
+                        critic2_state,
+                        target_critic1_params,
+                        target_critic2_params,
+                        log_alpha,
+                        alpha_opt_state,
+                        m,
+                    ) = sac_multi_update_fn(
+                        actor_state,
+                        critic1_state,
+                        critic2_state,
+                        target_critic1_params,
+                        target_critic2_params,
+                        log_alpha,
+                        alpha_opt_state,
+                        jnp.asarray(obs_buf),
+                        jnp.asarray(act_buf),
+                        jnp.asarray(rew_buf),
+                        jnp.asarray(next_obs_buf),
+                        jnp.asarray(not_done_buf),
+                        scan_keys,
+                        cfg.tau,
+                    )
 
-                metrics = {
-                    "actor": float(m["actor"]),
-                    "critic": float(m["critic"]),
-                    "alpha": float(m["alpha"]),
-                }
+                    metrics = {
+                        "actor": float(m["actor"]),
+                        "critic": float(m["critic"]),
+                        "alpha": float(m["alpha"]),
+                    }
         else:
-            metrics = {"actor": 0.0, "critic": 0.0, "alpha": float(np.exp(float(log_alpha)))}
+            metrics = {"actor": 0.0, "critic": 0.0, "alpha": current_alpha_value()}
 
         if total_steps - last_log >= cfg.log_every:
             last_log = total_steps
             sps = int(total_steps / max(time.time() - start_time, 1e-6))
+            rollkeep_str = f"{rollout_keep_frac:.2f}" if rollout_keep_frac is not None else "N/A"
             print(
                 f"Step {total_steps:8d} | SPS {sps:6d} | "
                 f"Actor {metrics['actor']:.4f} | Critic {metrics['critic']:.4f} | "
                 f"Alpha {metrics['alpha']:.4f} | ModelLoss {model_loss_value:.4f} | "
                 f"Upd {num_updates:2d} | RealRatio {effective_real_ratio:.2f} | "
-                f"RollKeep {rollout_keep_frac:.2f}"
+                f"RollKeep {rollkeep_str:>4} | RollH {rollout_horizon_now:2d} | "
+                f"MUpd {model_loss_updates} | DUpd {rollout_disagreement_updates}"
             )
 
         if total_steps - last_eval >= cfg.eval_every:
@@ -967,7 +1211,7 @@ def train(cfg: Config) -> None:
             eval_metrics = evaluate_policy(
                 cfg,
                 env,
-                actor_state.params,
+                current_actor_params(),
                 sample_action_fn,
                 eval_reset_fn,
                 eval_step_fn,
@@ -982,12 +1226,12 @@ def train(cfg: Config) -> None:
             history_rewards_std.append(float(eval_metrics["episode_reward_std"]))
 
             # Always keep latest evaluated checkpoint.
-            save_actor_params(last_actor_path, actor_state.params, jax)
+            save_actor_params(last_actor_path, current_actor_params(), jax)
 
             if eval_ret > best_eval:
                 best_eval = eval_ret
                 best_step = total_steps
-                save_actor_params(best_actor_path, actor_state.params, jax)
+                save_actor_params(best_actor_path, current_actor_params(), jax)
             print(
                 f"Eval @ {total_steps:8d} | EpisodeReward {eval_ret:8.2f} | "
                 f"Run {eval_metrics['episode_reward_run']:8.2f} | Ctrl {eval_metrics['episode_reward_ctrl']:8.2f} | "
@@ -1072,31 +1316,37 @@ def parse_args() -> Config:
     p.add_argument("--env", type=str, default="halfcheetah")
     p.add_argument("--backend", type=str, default="spring", choices=["spring", "positional", "generalized"])
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--total_steps", type=int, default=20_000_000)
-    p.add_argument("--num_envs", type=int, default=64)
+    p.add_argument("--total_steps", type=int, default=10_000_000)
+    p.add_argument("--num_envs", type=int, default=512)
     p.add_argument("--multi_device", action="store_true")
+    p.add_argument("--parallel_learner", action="store_true")
     p.add_argument("--episode_length", type=int, default=1000)
-    p.add_argument("--start_steps", type=int, default=5000)
+    p.add_argument("--start_steps", type=int, default=10_000)
     p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--updates_per_step", type=float, default=0.25)
-    p.add_argument("--max_sac_updates_per_iter", type=int, default=8)
-    p.add_argument("--log_alpha_min", type=float, default=-3.0)
-    p.add_argument("--log_alpha_max", type=float, default=0.0)
-    p.add_argument("--actor_lr", type=float, default=1e-4)
+    p.add_argument("--updates_per_step", type=float, default=0.15)
+    p.add_argument("--max_sac_updates_per_iter", type=int, default=64)
+    p.add_argument("--log_alpha_min", type=float, default=-8.0)
+    p.add_argument("--log_alpha_max", type=float, default=2.0)
+    p.add_argument("--actor_lr", type=float, default=3e-4)
     p.add_argument("--critic_lr", type=float, default=3e-4)
-    p.add_argument("--alpha_lr", type=float, default=3e-4)
-    p.add_argument("--model_lr", type=float, default=1e-4)
+    p.add_argument("--alpha_lr", type=float, default=5e-5)
+    p.add_argument("--model_lr", type=float, default=3e-4)
     p.add_argument("--grad_clip_norm", type=float, default=5.0)
-    p.add_argument("--model_train_freq", type=int, default=5000)
+    p.add_argument("--model_train_freq", type=int, default=500)
     p.add_argument("--model_rollout_freq", type=int, default=5000)
-    p.add_argument("--model_rollout_horizon", type=int, default=2)
+    p.add_argument("--model_rollout_horizon", type=int, default=1)
     p.add_argument("--model_rollout_batch", type=int, default=2000)
+    p.add_argument("--model_rollout_horizon_min", type=int, default=1)
+    p.add_argument("--model_rollout_ramp_steps", type=int, default=1_000_000)
     p.add_argument("--rollout_keep_ratio", type=float, default=0.3)
-    p.add_argument("--max_model_disagreement", type=float, default=0.0)
+    p.add_argument("--max_model_disagreement", type=float, default=0)
     p.add_argument("--real_ratio", type=float, default=0.9)
-    p.add_argument("--model_warmup_steps", type=int, default=300000)
-    p.add_argument("--eval_every", type=int, default=50000)
-    p.add_argument("--eval_episodes", type=int, default=1)
+    p.add_argument("--model_warmup_steps", type=int, default=300_000)
+    p.add_argument("--real_ratio_ramp_steps", type=int, default=3_000_000)
+    p.add_argument("--eval_every", type=int, default=200_000)
+    p.add_argument("--eval_num_envs", type=int, default=128)
+    p.add_argument("--eval_episodes", type=int, default=3)
+    p.add_argument("--eval_episode_length", type=int, default=500)
     p.add_argument("--log_every", type=int, default=5000)
     p.add_argument("--smooth_window", type=int, default=7)
 
@@ -1109,6 +1359,7 @@ def parse_args() -> Config:
     cfg.total_steps = args.total_steps
     cfg.num_envs = args.num_envs
     cfg.multi_device = args.multi_device
+    cfg.parallel_learner = args.parallel_learner
     cfg.episode_length = args.episode_length
     cfg.start_steps = args.start_steps
     cfg.batch_size = args.batch_size
@@ -1125,12 +1376,17 @@ def parse_args() -> Config:
     cfg.model_rollout_freq = args.model_rollout_freq
     cfg.model_rollout_horizon = args.model_rollout_horizon
     cfg.model_rollout_batch = args.model_rollout_batch
+    cfg.model_rollout_horizon_min = args.model_rollout_horizon_min
+    cfg.model_rollout_ramp_steps = args.model_rollout_ramp_steps
     cfg.rollout_keep_ratio = args.rollout_keep_ratio
     cfg.max_model_disagreement = args.max_model_disagreement
     cfg.real_ratio = args.real_ratio
     cfg.model_warmup_steps = args.model_warmup_steps
+    cfg.real_ratio_ramp_steps = args.real_ratio_ramp_steps
     cfg.eval_every = args.eval_every
+    cfg.eval_num_envs = args.eval_num_envs
     cfg.eval_episodes = args.eval_episodes
+    cfg.eval_episode_length = args.eval_episode_length
     cfg.log_every = args.log_every
     cfg.smooth_window = args.smooth_window
     return cfg
