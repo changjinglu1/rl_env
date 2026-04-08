@@ -35,7 +35,7 @@ class Config:
     backend: str = "spring"
     seed: int = 42
 
-    total_steps: int = 10_000_000
+    total_steps: int = 20_000_000
     num_envs: int = 512
     # Optional: shard environment collection across all local JAX devices.
     multi_device: bool = False
@@ -842,8 +842,6 @@ def train(cfg: Config) -> None:
     history_rewards_ctrl = []
     history_rewards_std = []
     start_time = time.time()
-    debug_every_steps = max(int(cfg.log_every), int(cfg.num_envs))
-    last_real_write_debug_step = -debug_every_steps
     # Use elapsed-step triggers so frequency is stable even when num_envs >= freq.
     last_model_train_step = -int(cfg.model_train_freq)
     last_model_rollout_step = -int(cfg.model_rollout_freq)
@@ -934,16 +932,6 @@ def train(cfg: Config) -> None:
         rew_np = np.asarray(rew_np, dtype=np.float32).reshape((-1,))
         not_done_np = np.asarray(not_done_np, dtype=np.float32).reshape((-1,))
 
-        if total_steps - last_real_write_debug_step >= debug_every_steps:
-            print(
-                "Adding real batch before write: obs mean/std",
-                float(obs_np.mean()),
-                float(obs_np.std()),
-                "act mean/std",
-                float(act_np.mean()),
-                float(act_np.std()),
-            )
-            last_real_write_debug_step = total_steps
         real_buffer.add_batch(obs_np, act_np, rew_np, next_obs_np, not_done_np)
         total_steps += cfg.num_envs
 
@@ -1316,7 +1304,7 @@ def parse_args() -> Config:
     p.add_argument("--env", type=str, default="halfcheetah")
     p.add_argument("--backend", type=str, default="spring", choices=["spring", "positional", "generalized"])
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--total_steps", type=int, default=10_000_000)
+    p.add_argument("--total_steps", type=int, default=20_000_000)
     p.add_argument("--num_envs", type=int, default=512)
     p.add_argument("--multi_device", action="store_true")
     p.add_argument("--parallel_learner", action="store_true")
