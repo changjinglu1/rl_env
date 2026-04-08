@@ -75,6 +75,7 @@ class Config:
 
     ensemble_size: int = 8
     model_train_epochs: int = 10
+    model_done_loss_weight: float = 0.2
     model_train_freq: int = 500
     model_rollout_freq: int = 5_000
     model_rollout_batch: int = 2_000
@@ -233,7 +234,9 @@ def build_modules(nn, jnp, obs_dim: int, act_dim: int, hidden_dim: int):
             mean = nn.Dense(out_dim)(x)
             logvar = nn.Dense(out_dim)(x)
             logvar = jnp.clip(logvar, -10.0, 2.0)
-            return mean, logvar
+            # A separate termination head predicts done probability.
+            done_logit = nn.Dense(1)(x)
+            return mean, logvar, done_logit
 
     return Actor(), Critic(), Dynamics()
 
@@ -379,16 +382,18 @@ def make_sac_fns(
     return sample_action, update_step
 
 
-def make_dynamics_fns(jax, jnp, optax, dynamics_def):
+def make_dynamics_fns(jax, jnp, optax, dynamics_def, done_loss_weight: float):
     @jax.jit
     def train_one_model(model_state, batch, in_mean, in_std, out_mean, out_std):
         obs = batch["obs"]
         act = batch["act"]
         rew = batch["rew"]
         next_obs = batch["next_obs"]
+        not_done = batch["not_done"]
 
         # MBPO dynamics target: delta state and one-step reward.
         target = jnp.concatenate([next_obs - obs, rew], axis=-1)
+        done_target = 1.0 - not_done
 
         sa = jnp.concatenate([obs, act], axis=-1)
         sa_n = (sa - in_mean) / (in_std + 1e-6)
@@ -398,11 +403,12 @@ def make_dynamics_fns(jax, jnp, optax, dynamics_def):
         a_n = sa_n[:, obs.shape[-1] :]
 
         def loss_fn(params):
-            mu, logvar = dynamics_def.apply(params, s_n, a_n)
+            mu, logvar, done_logit = dynamics_def.apply(params, s_n, a_n)
             inv_var = jnp.exp(-logvar)
             # Gaussian NLL lets each model express aleatoric uncertainty.
             nll = ((mu - tar_n) ** 2 * inv_var + logvar).mean()
-            return nll
+            done_bce = optax.sigmoid_binary_cross_entropy(done_logit, done_target).mean()
+            return nll + done_loss_weight * done_bce
 
         loss, grads = jax.value_and_grad(loss_fn)(model_state.params)
         model_state = model_state.apply_gradients(grads=grads)
@@ -410,20 +416,24 @@ def make_dynamics_fns(jax, jnp, optax, dynamics_def):
 
     @jax.jit
     def predict_one(model_params, obs, act, in_mean, in_std, out_mean, out_std, key):
+        noise_key, done_key = jax.random.split(key)
         sa = jnp.concatenate([obs, act], axis=-1)
-        sa_n = (sa - in_mean) / (in_std + 1e-6)
+        sa_n = (sa - in_mean) / (in_std + 1e-6) # 输入归一化，减去均值除以标准差
         obs_dim = obs.shape[-1]
         s_n = sa_n[:, :obs_dim]
         a_n = sa_n[:, obs_dim:]
 
-        mu, logvar = dynamics_def.apply(model_params, s_n, a_n)
+        mu, logvar, done_logit = dynamics_def.apply(model_params, s_n, a_n)
         std = jnp.exp(0.5 * logvar)
-        pred_n = mu + std * jax.random.normal(key, shape=mu.shape)
+        pred_n = mu + std * jax.random.normal(noise_key, shape=mu.shape)
         pred = pred_n * (out_std + 1e-6) + out_mean
         delta = pred[:, :obs_dim]
         reward = pred[:, obs_dim:]
         next_obs = obs + delta
-        return next_obs, reward
+        done_prob = jax.nn.sigmoid(done_logit)
+        done_sample = jax.random.bernoulli(done_key, p=done_prob).astype(jnp.float32)
+        not_done_pred = 1.0 - done_sample
+        return next_obs, reward, not_done_pred
 
     return train_one_model, predict_one
 
@@ -787,7 +797,13 @@ def train(cfg: Config) -> None:
         last_metrics = jax.tree.map(lambda arr: arr[-1], metrics_seq)
         return (*final_carry, last_metrics)
 
-    train_model_fn, predict_model_fn = make_dynamics_fns(jax, jnp, optax, dynamics_def)
+    train_model_fn, predict_model_fn = make_dynamics_fns(
+        jax,
+        jnp,
+        optax,
+        dynamics_def,
+        done_loss_weight=cfg.model_done_loss_weight,
+    )
 
     if use_parallel_learner:
         device_list = jax.local_devices()
@@ -992,9 +1008,10 @@ def train(cfg: Config) -> None:
                     # Predict all ensemble outputs on device, then sample one model per sample.
                     ens_next = []
                     ens_rew = []
+                    ens_not_done = []
                     for mi in range(cfg.ensemble_size):
                         key, pkey = jax.random.split(key)
-                        pred_next, pred_rew = predict_model_fn(
+                        pred_next, pred_rew, pred_not_done = predict_model_fn(
                             model_states[mi].params,
                             rollout_obs_jnp,
                             act_jnp,
@@ -1006,9 +1023,11 @@ def train(cfg: Config) -> None:
                         )
                         ens_next.append(pred_next)
                         ens_rew.append(pred_rew)
+                        ens_not_done.append(pred_not_done)
 
                     ens_next = jnp.stack(ens_next, axis=0)
                     ens_rew = jnp.stack(ens_rew, axis=0)
+                    ens_not_done = jnp.stack(ens_not_done, axis=0)
 
                     key, idx_key = jax.random.split(key)
                     model_idx = jax.random.randint(
@@ -1020,15 +1039,28 @@ def train(cfg: Config) -> None:
                     batch_idx = jnp.arange(cfg.model_rollout_batch)
                     next_obs_pred_jnp = ens_next[model_idx, batch_idx, :]
                     rew_pred_jnp = ens_rew[model_idx, batch_idx, :]
-                    disagreement_jnp = jnp.var(ens_next, axis=0).mean(axis=-1) + jnp.var(ens_rew, axis=0).squeeze(-1)
+                    not_done_pred_jnp = ens_not_done[model_idx, batch_idx, :]
+                    disagreement_jnp = (
+                        jnp.var(ens_next, axis=0).mean(axis=-1)
+                        + jnp.var(ens_rew, axis=0).squeeze(-1)
+                        + jnp.var(ens_not_done, axis=0).squeeze(-1)
+                    )
 
-                    rollout_obs_np, act_np, next_obs_pred, rew_pred, disagreement = jax.device_get(
-                        (rollout_obs_jnp, act_jnp, next_obs_pred_jnp, rew_pred_jnp, disagreement_jnp)
+                    rollout_obs_np, act_np, next_obs_pred, rew_pred, not_done_pred, disagreement = jax.device_get(
+                        (
+                            rollout_obs_jnp,
+                            act_jnp,
+                            next_obs_pred_jnp,
+                            rew_pred_jnp,
+                            not_done_pred_jnp,
+                            disagreement_jnp,
+                        )
                     )
                     rollout_obs_np = np.asarray(rollout_obs_np, dtype=np.float32)
                     act_np = np.asarray(act_np, dtype=np.float32)
                     next_obs_pred = np.asarray(next_obs_pred, dtype=np.float32)
                     rew_pred = np.asarray(rew_pred, dtype=np.float32)
+                    not_done_pred = np.asarray(not_done_pred, dtype=np.float32).squeeze(-1)
                     disagreement = np.asarray(disagreement, dtype=np.float32)
                     rollout_disagreement_value = float(np.mean(disagreement))
                     rollout_disagreement_ema = (
@@ -1055,7 +1087,7 @@ def train(cfg: Config) -> None:
                     rollout_keep_frac = kept / float(cfg.model_rollout_batch)
 
                     if kept > 0:
-                        not_done_model = np.ones((kept,), dtype=np.float32)
+                        not_done_model = np.clip(not_done_pred[keep_mask], 0.0, 1.0).astype(np.float32)
                         model_buffer.add_batch(
                             rollout_obs_np[keep_mask],
                             act_np[keep_mask],
@@ -1320,6 +1352,7 @@ def parse_args() -> Config:
     p.add_argument("--alpha_lr", type=float, default=5e-5)
     p.add_argument("--model_lr", type=float, default=3e-4)
     p.add_argument("--grad_clip_norm", type=float, default=5.0)
+    p.add_argument("--model_done_loss_weight", type=float, default=0.2)
     p.add_argument("--model_train_freq", type=int, default=500)
     p.add_argument("--model_rollout_freq", type=int, default=5000)
     p.add_argument("--model_rollout_horizon", type=int, default=1)
@@ -1360,6 +1393,7 @@ def parse_args() -> Config:
     cfg.alpha_lr = args.alpha_lr
     cfg.model_lr = args.model_lr
     cfg.grad_clip_norm = args.grad_clip_norm
+    cfg.model_done_loss_weight = args.model_done_loss_weight
     cfg.model_train_freq = args.model_train_freq
     cfg.model_rollout_freq = args.model_rollout_freq
     cfg.model_rollout_horizon = args.model_rollout_horizon
