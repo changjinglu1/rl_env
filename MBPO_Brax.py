@@ -35,7 +35,7 @@ class Config:
     backend: str = "spring"
     seed: int = 42
 
-    total_steps: int = 20_000_000
+    total_steps: int = 10_000_000
     num_envs: int = 512
     # Optional: shard environment collection across all local JAX devices.
     multi_device: bool = False
@@ -82,22 +82,22 @@ class Config:
     # Rollout horizon starts small and grows toward model_rollout_horizon.
     model_rollout_horizon_min: int = 1
     model_rollout_horizon: int = 1
-    model_rollout_ramp_steps: int = 1_000_000
-    # Require a few model updates before allowing the horizon to grow.
+    model_rollout_ramp_steps: int = 10_000_000 # 模型 rollout horizon 从最小值逐步增加到最大值所需要的“过渡步数
+    # 模型生成的虚拟数据质量在训练初期可能较差，因此在前几个更新周期内，保持较短的模型生成轨迹长度，以减少模型误差的累积对学习的影响。
     model_rollout_quality_warmup_updates: int = 3
     # Power > 1 makes rollout horizon growth slower early on.
     model_rollout_growth_power: float = 2.0
     # Keep only the lowest-uncertainty synthetic transitions.
     rollout_keep_ratio: float = 0.3
     # Optional hard threshold on ensemble disagreement (0 disables threshold).
-    max_model_disagreement: float = 0.0
+    max_model_disagreement: float = 0.5
 
     eval_every: int = 200_000
     # Number of parallel environments used only during evaluation.
     eval_num_envs: int = 128
-    eval_episodes: int = 3
+    eval_episodes: int = 10
     eval_episode_length: int = 500
-    log_every: int = 5_000
+    log_every: int = 10_000
     smooth_window: int = 7
 
 
@@ -259,7 +259,7 @@ def make_sac_fns(
 
     def sample_action(actor_params, obs, key, deterministic: bool):
         # Tanh-Gaussian policy: sample pre_tanh action then squash to [-1, 1].
-        mu, log_std = actor_def.apply(actor_params, obs)
+        mu, log_std = actor_def.apply(actor_params, obs) # 前向计算，类似于pytorch的forward函数，输入是actor_params和obs，输出是mu和log_std
         std = jnp.exp(log_std)
         if deterministic:
             pre_tanh = mu
@@ -313,13 +313,15 @@ def make_sac_fns(
 
         critic_loss, (critic1_grads, critic2_grads) = jax.value_and_grad(
             critic_loss_fn, argnums=(0, 1)
-        )(critic1_state.params, critic2_state.params)
+        )(critic1_state.params, critic2_state.params) # 计算critic_loss，并且分别计算critic1_params和critic2_params的梯度
 
-        if axis_name is not None:
+        if axis_name is not None: # 在多设备并行学习模式下，使用jax.lax.pmean在设备间平均梯度和损失，以保持同步更新。
             critic1_grads = jax.lax.pmean(critic1_grads, axis_name=axis_name)
             critic2_grads = jax.lax.pmean(critic2_grads, axis_name=axis_name)
             critic_loss = jax.lax.pmean(critic_loss, axis_name=axis_name)
-
+        # 应用梯度更新critic网络参数，得到新的critic_state。
+        # apply_gradients是Flax中TrainState的方法，接受计算得到的梯度并返回一个新的TrainState，其中参数已经更新。
+        # 类似于PyTorch中的optimizer.step()，但在Flax中是函数式的，返回新的状态而不是原地修改。
         critic1_state = critic1_state.apply_gradients(grads=critic1_grads)
         critic2_state = critic2_state.apply_gradients(grads=critic2_grads)
 
@@ -435,12 +437,19 @@ def make_dynamics_fns(jax, jnp, optax, dynamics_def, done_loss_weight: float):
         not_done_pred = 1.0 - done_sample
         return next_obs, reward, not_done_pred
 
-    return train_one_model, predict_one
+    @jax.jit
+    def predict_ensemble(model_params_stack, obs, act, in_mean, in_std, out_mean, out_std, keys):
+        def one_model(params_i, key_i):
+            return predict_one(params_i, obs, act, in_mean, in_std, out_mean, out_std, key_i)
+
+        ens_next, ens_rew, ens_not_done = jax.vmap(one_model, in_axes=(0, 0))(model_params_stack, keys)
+        return ens_next, ens_rew, ens_not_done
+
+    return train_one_model, predict_one, predict_ensemble
 
 
 def evaluate_policy(
     cfg: Config,
-    env,
     actor_params,
     sample_action_fn,
     reset_fn,
@@ -643,7 +652,7 @@ def train(cfg: Config) -> None:
     actor_params = actor_def.init(actor_key, init_obs)
     critic1_params = critic_def.init(c1_key, init_obs, init_act)
     critic2_params = critic_def.init(c2_key, init_obs, init_act)
-
+    # 每个网络都使用Adam优化器，并且在更新前进行全局梯度裁剪，以提高训练稳定性。
     actor_tx = optax.chain(optax.clip_by_global_norm(cfg.grad_clip_norm), optax.adam(cfg.actor_lr))
     critic_tx = optax.chain(optax.clip_by_global_norm(cfg.grad_clip_norm), optax.adam(cfg.critic_lr))
     model_tx = optax.chain(optax.clip_by_global_norm(cfg.grad_clip_norm), optax.adam(cfg.model_lr))
@@ -714,6 +723,7 @@ def train(cfg: Config) -> None:
             log_alpha_max=cfg.log_alpha_max,
             axis_name="devices",
         )
+        # 指定输入参数在设备维度上的分片方式
         sac_update_parallel_fn = jax.pmap(
             sac_update_parallel_base_fn,
             axis_name="devices",
@@ -797,13 +807,41 @@ def train(cfg: Config) -> None:
         last_metrics = jax.tree.map(lambda arr: arr[-1], metrics_seq)
         return (*final_carry, last_metrics)
 
-    train_model_fn, predict_model_fn = make_dynamics_fns(
+    train_model_fn, predict_model_fn, predict_ensemble_fn = make_dynamics_fns(
         jax,
         jnp,
         optax,
         dynamics_def,
         done_loss_weight=cfg.model_done_loss_weight,
     )
+
+    @jax.jit
+    def train_ensemble_models_fn(model_states_stacked, batch, in_mean, in_std, out_mean, out_std):
+        def one_model_update(model_state, obs, act, rew, next_obs, not_done):
+            model_batch = {
+                "obs": obs,
+                "act": act,
+                "rew": rew,
+                "next_obs": next_obs,
+                "not_done": not_done,
+            }
+            return train_model_fn(model_state, model_batch, in_mean, in_std, out_mean, out_std)
+
+        new_states, losses = jax.vmap(one_model_update, in_axes=(0, 0, 0, 0, 0, 0))(
+            model_states_stacked,
+            batch["obs"],
+            batch["act"],
+            batch["rew"],
+            batch["next_obs"],
+            batch["not_done"],
+        )
+        return new_states, losses
+
+    def stack_model_states(states):
+        return jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states)
+
+    def unstack_model_states(stacked_states):
+        return [jax.tree.map(lambda x, i=i: x[i], stacked_states) for i in range(cfg.ensemble_size)]
 
     if use_parallel_learner:
         device_list = jax.local_devices()
@@ -818,7 +856,7 @@ def train(cfg: Config) -> None:
         target_critic2_params = replicate_tree(target_critic2_params)
         log_alpha = replicate_tree(log_alpha)
         alpha_opt_state = replicate_tree(alpha_opt_state)
-
+    # 在并行学习模式下，定义一个函数single_replica来从每个参数树中提取第一个副本，以便在需要单设备参数时使用。
     def single_replica(tree):
         if use_parallel_learner:
             return jax.tree.map(lambda x: x[0], tree)
@@ -840,6 +878,8 @@ def train(cfg: Config) -> None:
     total_steps = 0
     update_budget = 0.0
     last_log = 0
+    last_log_steps = 0
+    last_log_time = time.time()
     last_eval = 0
     best_eval = -1e18
     best_step = 0
@@ -857,7 +897,6 @@ def train(cfg: Config) -> None:
     history_rewards_run = []
     history_rewards_ctrl = []
     history_rewards_std = []
-    start_time = time.time()
     # Use elapsed-step triggers so frequency is stable even when num_envs >= freq.
     last_model_train_step = -int(cfg.model_train_freq)
     last_model_rollout_step = -int(cfg.model_rollout_freq)
@@ -966,19 +1005,31 @@ def train(cfg: Config) -> None:
                 out_std = jnp.asarray(norm.out_std)
 
                 losses = []
+                model_states_stacked = stack_model_states(model_states)
                 for _ in range(cfg.model_train_epochs):
-                    for m in range(cfg.ensemble_size):
-                        batch_np = real_buffer.sample(cfg.batch_size)
-                        batch_jnp = {k: jnp.asarray(v) for k, v in batch_np.items()}
-                        model_states[m], mloss = train_model_fn(
-                            model_states[m],
-                            batch_jnp,
-                            in_mean,
-                            in_std,
-                            out_mean,
-                            out_std,
-                        )
-                        losses.append(float(mloss))
+                    batch_np = real_buffer.sample(cfg.batch_size * cfg.ensemble_size)
+                    batch_jnp = {
+                        "obs": jnp.asarray(batch_np["obs"]).reshape(cfg.ensemble_size, cfg.batch_size, obs_dim),
+                        "act": jnp.asarray(batch_np["act"]).reshape(cfg.ensemble_size, cfg.batch_size, act_dim),
+                        "rew": jnp.asarray(batch_np["rew"]).reshape(cfg.ensemble_size, cfg.batch_size, 1),
+                        "next_obs": jnp.asarray(batch_np["next_obs"]).reshape(
+                            cfg.ensemble_size, cfg.batch_size, obs_dim
+                        ),
+                        "not_done": jnp.asarray(batch_np["not_done"]).reshape(
+                            cfg.ensemble_size, cfg.batch_size, 1
+                        ),
+                    }
+                    model_states_stacked, mloss_vec = train_ensemble_models_fn(
+                        model_states_stacked,
+                        batch_jnp,
+                        in_mean,
+                        in_std,
+                        out_mean,
+                        out_std,
+                    )
+                    losses.append(float(np.mean(np.asarray(jax.device_get(mloss_vec), dtype=np.float32))))
+
+                model_states = unstack_model_states(model_states_stacked)
                 if losses:
                     model_loss_value = float(np.mean(np.asarray(losses, dtype=np.float32)))
                     model_loss_ema = (
@@ -1000,34 +1051,28 @@ def train(cfg: Config) -> None:
                 in_std = jnp.asarray(norm.in_std)
                 out_mean = jnp.asarray(norm.out_mean)
                 out_std = jnp.asarray(norm.out_std)
+                model_params_stack = jax.tree.map(
+                    lambda *xs: jnp.stack(xs, axis=0),
+                    *[ms.params for ms in model_states],
+                )
 
                 for _ in range(rollout_horizon_now):
                     key, rkey = jax.random.split(key)
                     act_jnp, _ = sample_action_fn(current_actor_params(), rollout_obs_jnp, rkey, deterministic=False)
 
-                    # Predict all ensemble outputs on device, then sample one model per sample.
-                    ens_next = []
-                    ens_rew = []
-                    ens_not_done = []
-                    for mi in range(cfg.ensemble_size):
-                        key, pkey = jax.random.split(key)
-                        pred_next, pred_rew, pred_not_done = predict_model_fn(
-                            model_states[mi].params,
-                            rollout_obs_jnp,
-                            act_jnp,
-                            in_mean,
-                            in_std,
-                            out_mean,
-                            out_std,
-                            pkey,
-                        )
-                        ens_next.append(pred_next)
-                        ens_rew.append(pred_rew)
-                        ens_not_done.append(pred_not_done)
-
-                    ens_next = jnp.stack(ens_next, axis=0)
-                    ens_rew = jnp.stack(ens_rew, axis=0)
-                    ens_not_done = jnp.stack(ens_not_done, axis=0)
+                    # Predict all ensemble outputs in one vmapped call.
+                    key, pkeys = jax.random.split(key)
+                    ens_keys = jax.random.split(pkeys, cfg.ensemble_size)
+                    ens_next, ens_rew, ens_not_done = predict_ensemble_fn(
+                        model_params_stack,
+                        rollout_obs_jnp,
+                        act_jnp,
+                        in_mean,
+                        in_std,
+                        out_mean,
+                        out_std,
+                        ens_keys,
+                    )
 
                     key, idx_key = jax.random.split(key)
                     model_idx = jax.random.randint(
@@ -1214,8 +1259,13 @@ def train(cfg: Config) -> None:
             metrics = {"actor": 0.0, "critic": 0.0, "alpha": current_alpha_value()}
 
         if total_steps - last_log >= cfg.log_every:
+            now = time.time()
+            step_delta = total_steps - last_log_steps
+            time_delta = now - last_log_time
+            sps = int(step_delta / max(time_delta, 1e-6))
             last_log = total_steps
-            sps = int(total_steps / max(time.time() - start_time, 1e-6))
+            last_log_steps = total_steps
+            last_log_time = now
             rollkeep_str = f"{rollout_keep_frac:.2f}" if rollout_keep_frac is not None else "N/A"
             print(
                 f"Step {total_steps:8d} | SPS {sps:6d} | "
@@ -1230,7 +1280,6 @@ def train(cfg: Config) -> None:
             last_eval = total_steps
             eval_metrics = evaluate_policy(
                 cfg,
-                env,
                 current_actor_params(),
                 sample_action_fn,
                 eval_reset_fn,
@@ -1336,7 +1385,7 @@ def parse_args() -> Config:
     p.add_argument("--env", type=str, default="halfcheetah")
     p.add_argument("--backend", type=str, default="spring", choices=["spring", "positional", "generalized"])
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--total_steps", type=int, default=20_000_000)
+    p.add_argument("--total_steps", type=int, default=10_000_000)
     p.add_argument("--num_envs", type=int, default=512)
     p.add_argument("--multi_device", action="store_true")
     p.add_argument("--parallel_learner", action="store_true")
@@ -1349,7 +1398,7 @@ def parse_args() -> Config:
     p.add_argument("--log_alpha_max", type=float, default=2.0)
     p.add_argument("--actor_lr", type=float, default=3e-4)
     p.add_argument("--critic_lr", type=float, default=3e-4)
-    p.add_argument("--alpha_lr", type=float, default=5e-5)
+    p.add_argument("--alpha_lr", type=float, default=3e-4)
     p.add_argument("--model_lr", type=float, default=3e-4)
     p.add_argument("--grad_clip_norm", type=float, default=5.0)
     p.add_argument("--model_done_loss_weight", type=float, default=0.2)
@@ -1360,15 +1409,15 @@ def parse_args() -> Config:
     p.add_argument("--model_rollout_horizon_min", type=int, default=1)
     p.add_argument("--model_rollout_ramp_steps", type=int, default=1_000_000)
     p.add_argument("--rollout_keep_ratio", type=float, default=0.3)
-    p.add_argument("--max_model_disagreement", type=float, default=0)
+    p.add_argument("--max_model_disagreement", type=float, default=0.5)
     p.add_argument("--real_ratio", type=float, default=0.9)
     p.add_argument("--model_warmup_steps", type=int, default=300_000)
     p.add_argument("--real_ratio_ramp_steps", type=int, default=3_000_000)
     p.add_argument("--eval_every", type=int, default=200_000)
     p.add_argument("--eval_num_envs", type=int, default=128)
-    p.add_argument("--eval_episodes", type=int, default=3)
+    p.add_argument("--eval_episodes", type=int, default=10)
     p.add_argument("--eval_episode_length", type=int, default=500)
-    p.add_argument("--log_every", type=int, default=5000)
+    p.add_argument("--log_every", type=int, default=10_000)
     p.add_argument("--smooth_window", type=int, default=7)
 
     args = p.parse_args()
