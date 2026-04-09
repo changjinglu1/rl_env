@@ -71,7 +71,7 @@ class Config:
     real_ratio: float = 0.9
     model_warmup_steps: int = 300_000
     # After model warmup, decay real_ratio from 1.0 to `real_ratio` over this many env steps.
-    real_ratio_ramp_steps: int = 3_000_000
+    real_ratio_ramp_steps: int = 10_000_000
 
     ensemble_size: int = 8
     model_train_epochs: int = 10
@@ -89,8 +89,11 @@ class Config:
     model_rollout_growth_power: float = 2.0
     # Keep only the lowest-uncertainty synthetic transitions.
     rollout_keep_ratio: float = 0.3
-    # Optional hard threshold on ensemble disagreement (0 disables threshold).
-    max_model_disagreement: float = 0.5
+    # Optional hard threshold on ensemble disagreement.
+    # When > 0, a progressive schedule is used from start -> end (0 disables threshold).
+    max_model_disagreement_start: float = 0.5
+    max_model_disagreement: float = 1.2
+    max_model_disagreement_ramp_steps: int = 10_000_000
 
     eval_every: int = 200_000
     # Number of parallel environments used only during evaluation.
@@ -730,6 +733,88 @@ def train(cfg: Config) -> None:
             in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None, 0),
         )
 
+        def sac_multi_update_parallel_base_fn(
+            actor_state,
+            critic1_state,
+            critic2_state,
+            target_critic1_params,
+            target_critic2_params,
+            log_alpha,
+            alpha_opt_state,
+            obs_batch,
+            act_batch,
+            rew_batch,
+            next_obs_batch,
+            not_done_batch,
+            tau,
+            key_batch,
+        ):
+            # Run multiple updates per device inside one scan to reduce host-side pmap dispatch overhead.
+            def body(carry, xs):
+                (
+                    a_state,
+                    c1_state,
+                    c2_state,
+                    tc1_params,
+                    tc2_params,
+                    la,
+                    a_opt_state,
+                ) = carry
+                obs, act, rew, next_obs, not_done, k = xs
+                batch = {
+                    "obs": obs,
+                    "act": act,
+                    "rew": rew,
+                    "next_obs": next_obs,
+                    "not_done": not_done,
+                }
+                (
+                    a_state,
+                    c1_state,
+                    c2_state,
+                    tc1_params,
+                    tc2_params,
+                    la,
+                    a_opt_state,
+                    metrics,
+                ) = sac_update_parallel_base_fn(
+                    a_state,
+                    c1_state,
+                    c2_state,
+                    tc1_params,
+                    tc2_params,
+                    la,
+                    a_opt_state,
+                    batch,
+                    tau,
+                    k,
+                )
+                new_carry = (a_state, c1_state, c2_state, tc1_params, tc2_params, la, a_opt_state)
+                return new_carry, metrics
+
+            init_carry = (
+                actor_state,
+                critic1_state,
+                critic2_state,
+                target_critic1_params,
+                target_critic2_params,
+                log_alpha,
+                alpha_opt_state,
+            )
+            final_carry, metrics_seq = jax.lax.scan(
+                body,
+                init_carry,
+                (obs_batch, act_batch, rew_batch, next_obs_batch, not_done_batch, key_batch),
+            )
+            last_metrics = jax.tree.map(lambda arr: arr[-1], metrics_seq)
+            return (*final_carry, last_metrics)
+
+        sac_multi_update_parallel_fn = jax.pmap(
+            sac_multi_update_parallel_base_fn,
+            axis_name="devices",
+            in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, 0),
+        )
+
     @jax.jit
     def sac_multi_update_fn(
         actor_state,
@@ -947,9 +1032,30 @@ def train(cfg: Config) -> None:
         progress = float(np.clip((total_steps - cfg.model_warmup_steps) / float(ramp), 0.0, 1.0))
         return float(start_ratio + progress * (end_ratio - start_ratio))
 
+    def current_max_model_disagreement() -> float:
+        end_thr = float(cfg.max_model_disagreement)
+        if end_thr <= 0.0:
+            return 0.0
+
+        start_thr = float(cfg.max_model_disagreement_start)
+        if start_thr <= 0.0:
+            start_thr = end_thr
+
+        # Keep strict threshold before model warmup, then relax toward the configured end threshold.
+        if total_steps < cfg.model_warmup_steps:
+            return start_thr
+
+        if end_thr <= start_thr:
+            return start_thr
+
+        ramp = max(1, int(cfg.max_model_disagreement_ramp_steps))
+        progress = float(np.clip((total_steps - cfg.model_warmup_steps) / float(ramp), 0.0, 1.0))
+        return float(start_thr + progress * (end_thr - start_thr))
+
     while total_steps < cfg.total_steps:
         num_updates = 0
         effective_real_ratio = current_real_ratio()
+        effective_max_disagreement = current_max_model_disagreement()
         rollout_keep_frac: float | None = None
         rollout_horizon_now = current_rollout_horizon()
         # Stage A: collect real transitions from Brax env.
@@ -1118,8 +1224,8 @@ def train(cfg: Config) -> None:
                     rollout_disagreement_updates += 1
 
                     keep_mask = np.ones((cfg.model_rollout_batch,), dtype=bool)
-                    if cfg.max_model_disagreement > 0.0:
-                        keep_mask &= disagreement <= cfg.max_model_disagreement
+                    if effective_max_disagreement > 0.0:
+                        keep_mask &= disagreement <= effective_max_disagreement
 
                     if cfg.rollout_keep_ratio < 1.0:
                         keep_k = max(1, int(cfg.model_rollout_batch * cfg.rollout_keep_ratio))
@@ -1178,43 +1284,49 @@ def train(cfg: Config) -> None:
 
                 if use_parallel_learner:
                     per_device_bs = cfg.batch_size // local_devices
-                    m_last = None
-                    for i in range(num_updates):
-                        obs_i = jnp.asarray(obs_buf[i].reshape(local_devices, per_device_bs, obs_dim))
-                        act_i = jnp.asarray(act_buf[i].reshape(local_devices, per_device_bs, act_dim))
-                        rew_i = jnp.asarray(rew_buf[i].reshape(local_devices, per_device_bs, 1))
-                        next_obs_i = jnp.asarray(next_obs_buf[i].reshape(local_devices, per_device_bs, obs_dim))
-                        not_done_i = jnp.asarray(not_done_buf[i].reshape(local_devices, per_device_bs, 1))
-                        batch_i = {
-                            "obs": obs_i,
-                            "act": act_i,
-                            "rew": rew_i,
-                            "next_obs": next_obs_i,
-                            "not_done": not_done_i,
-                        }
-                        key, update_key = jax.random.split(key)
-                        device_keys = jax.random.split(update_key, local_devices)
-                        (
-                            actor_state,
-                            critic1_state,
-                            critic2_state,
-                            target_critic1_params,
-                            target_critic2_params,
-                            log_alpha,
-                            alpha_opt_state,
-                            m_last,
-                        ) = sac_update_parallel_fn(
-                            actor_state,
-                            critic1_state,
-                            critic2_state,
-                            target_critic1_params,
-                            target_critic2_params,
-                            log_alpha,
-                            alpha_opt_state,
-                            batch_i,
-                            cfg.tau,
-                            device_keys,
-                        )
+                    obs_scan = jnp.asarray(obs_buf).reshape(num_updates, local_devices, per_device_bs, obs_dim)
+                    act_scan = jnp.asarray(act_buf).reshape(num_updates, local_devices, per_device_bs, act_dim)
+                    rew_scan = jnp.asarray(rew_buf).reshape(num_updates, local_devices, per_device_bs, 1)
+                    next_obs_scan = jnp.asarray(next_obs_buf).reshape(num_updates, local_devices, per_device_bs, obs_dim)
+                    not_done_scan = jnp.asarray(not_done_buf).reshape(num_updates, local_devices, per_device_bs, 1)
+
+                    # pmap expects device axis first: [devices, updates, per_device_bs, ...].
+                    obs_scan = jnp.swapaxes(obs_scan, 0, 1)
+                    act_scan = jnp.swapaxes(act_scan, 0, 1)
+                    rew_scan = jnp.swapaxes(rew_scan, 0, 1)
+                    next_obs_scan = jnp.swapaxes(next_obs_scan, 0, 1)
+                    not_done_scan = jnp.swapaxes(not_done_scan, 0, 1)
+
+                    key, update_key = jax.random.split(key)
+                    device_scan_keys = jax.random.split(update_key, local_devices * num_updates).reshape(
+                        local_devices, num_updates, 2
+                    )
+
+                    (
+                        actor_state,
+                        critic1_state,
+                        critic2_state,
+                        target_critic1_params,
+                        target_critic2_params,
+                        log_alpha,
+                        alpha_opt_state,
+                        m_last,
+                    ) = sac_multi_update_parallel_fn(
+                        actor_state,
+                        critic1_state,
+                        critic2_state,
+                        target_critic1_params,
+                        target_critic2_params,
+                        log_alpha,
+                        alpha_opt_state,
+                        obs_scan,
+                        act_scan,
+                        rew_scan,
+                        next_obs_scan,
+                        not_done_scan,
+                        cfg.tau,
+                        device_scan_keys,
+                    )
                     metrics = {
                         "actor": float(jax.device_get(m_last["actor"][0])),
                         "critic": float(jax.device_get(m_last["critic"][0])),
@@ -1272,6 +1384,7 @@ def train(cfg: Config) -> None:
                 f"Actor {metrics['actor']:.4f} | Critic {metrics['critic']:.4f} | "
                 f"Alpha {metrics['alpha']:.4f} | ModelLoss {model_loss_value:.4f} | "
                 f"Upd {num_updates:2d} | RealRatio {effective_real_ratio:.2f} | "
+                f"MaxDis {effective_max_disagreement:.2f} | "
                 f"RollKeep {rollkeep_str:>4} | RollH {rollout_horizon_now:2d} | "
                 f"MUpd {model_loss_updates} | DUpd {rollout_disagreement_updates}"
             )
@@ -1409,10 +1522,12 @@ def parse_args() -> Config:
     p.add_argument("--model_rollout_horizon_min", type=int, default=1)
     p.add_argument("--model_rollout_ramp_steps", type=int, default=1_000_000)
     p.add_argument("--rollout_keep_ratio", type=float, default=0.3)
-    p.add_argument("--max_model_disagreement", type=float, default=0.5)
+    p.add_argument("--max_model_disagreement_start", type=float, default=0.5)
+    p.add_argument("--max_model_disagreement", type=float, default=1.2)
+    p.add_argument("--max_model_disagreement_ramp_steps", type=int, default=10_000_000)
     p.add_argument("--real_ratio", type=float, default=0.9)
     p.add_argument("--model_warmup_steps", type=int, default=300_000)
-    p.add_argument("--real_ratio_ramp_steps", type=int, default=3_000_000)
+    p.add_argument("--real_ratio_ramp_steps", type=int, default=10_000_000)
     p.add_argument("--eval_every", type=int, default=200_000)
     p.add_argument("--eval_num_envs", type=int, default=128)
     p.add_argument("--eval_episodes", type=int, default=10)
@@ -1450,7 +1565,9 @@ def parse_args() -> Config:
     cfg.model_rollout_horizon_min = args.model_rollout_horizon_min
     cfg.model_rollout_ramp_steps = args.model_rollout_ramp_steps
     cfg.rollout_keep_ratio = args.rollout_keep_ratio
+    cfg.max_model_disagreement_start = args.max_model_disagreement_start
     cfg.max_model_disagreement = args.max_model_disagreement
+    cfg.max_model_disagreement_ramp_steps = args.max_model_disagreement_ramp_steps
     cfg.real_ratio = args.real_ratio
     cfg.model_warmup_steps = args.model_warmup_steps
     cfg.real_ratio_ramp_steps = args.real_ratio_ramp_steps
