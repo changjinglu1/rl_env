@@ -66,7 +66,7 @@ class Config:
     alpha_init: float = 0.2
 
     real_buffer_size: int = 1_000_000
-    model_buffer_size: int = 800_000
+    model_buffer_size: int = 100_000
     # SAC updates start with only real data, then gradually mix in more model data.
     real_ratio: float = 0.9
     model_warmup_steps: int = 300_000
@@ -77,8 +77,8 @@ class Config:
     model_train_epochs: int = 10
     model_done_loss_weight: float = 0.2
     model_train_freq: int = 500
-    model_rollout_freq: int = 5_000
-    model_rollout_batch: int = 2_000
+    model_rollout_freq: int = 1_000
+    model_rollout_batch: int = 5_000
     # Rollout horizon starts small and grows toward model_rollout_horizon.
     model_rollout_horizon_min: int = 1
     model_rollout_horizon: int = 1
@@ -89,10 +89,10 @@ class Config:
     model_rollout_growth_power: float = 2.0
     # Keep only the lowest-uncertainty synthetic transitions.
     rollout_keep_ratio: float = 0.3
-    # Optional hard threshold on ensemble disagreement.
+    # Optional hard threshold on ensemble disagreement (state_var/obs_dim + reward_var + done_var).
     # When > 0, a progressive schedule is used from start -> end (0 disables threshold).
-    max_model_disagreement_start: float = 0.5
-    max_model_disagreement: float = 1.2
+    max_model_disagreement_start: float = 0.5  # Stricter early filter
+    max_model_disagreement: float = 1.5  # Relax later but keep threshold meaningful
     max_model_disagreement_ramp_steps: int = 10_000_000
 
     eval_every: int = 200_000
@@ -1057,6 +1057,7 @@ def train(cfg: Config) -> None:
         effective_real_ratio = current_real_ratio()
         effective_max_disagreement = current_max_model_disagreement()
         rollout_keep_frac: float | None = None
+        threshold_keep_frac: float | None = None
         rollout_horizon_now = current_rollout_horizon()
         # Stage A: collect real transitions from Brax env.
         if total_steps < cfg.start_steps:
@@ -1191,8 +1192,9 @@ def train(cfg: Config) -> None:
                     next_obs_pred_jnp = ens_next[model_idx, batch_idx, :]
                     rew_pred_jnp = ens_rew[model_idx, batch_idx, :]
                     not_done_pred_jnp = ens_not_done[model_idx, batch_idx, :]
+                    # Normalize disagreement by obs_dim so that state/reward/done parts have comparable scale.
                     disagreement_jnp = (
-                        jnp.var(ens_next, axis=0).mean(axis=-1)
+                        jnp.var(ens_next, axis=0).mean(axis=-1) / float(obs_dim)
                         + jnp.var(ens_rew, axis=0).squeeze(-1)
                         + jnp.var(ens_not_done, axis=0).squeeze(-1)
                     )
@@ -1224,8 +1226,11 @@ def train(cfg: Config) -> None:
                     rollout_disagreement_updates += 1
 
                     keep_mask = np.ones((cfg.model_rollout_batch,), dtype=bool)
+                    threshold_mask = np.ones((cfg.model_rollout_batch,), dtype=bool)
                     if effective_max_disagreement > 0.0:
-                        keep_mask &= disagreement <= effective_max_disagreement
+                        threshold_mask = disagreement <= effective_max_disagreement
+                    keep_mask &= threshold_mask
+                    threshold_keep_frac = float(np.mean(threshold_mask))
 
                     if cfg.rollout_keep_ratio < 1.0:
                         keep_k = max(1, int(cfg.model_rollout_batch * cfg.rollout_keep_ratio))
@@ -1379,14 +1384,15 @@ def train(cfg: Config) -> None:
             last_log_steps = total_steps
             last_log_time = now
             rollkeep_str = f"{rollout_keep_frac:.2f}" if rollout_keep_frac is not None else "N/A"
+            threshkeep_str = f"{threshold_keep_frac:.2f}" if threshold_keep_frac is not None else "N/A"
+            dis_ema_str = f"{rollout_disagreement_ema:.2f}" if rollout_disagreement_ema is not None else "N/A"
             print(
                 f"Step {total_steps:8d} | SPS {sps:6d} | "
                 f"Actor {metrics['actor']:.4f} | Critic {metrics['critic']:.4f} | "
                 f"Alpha {metrics['alpha']:.4f} | ModelLoss {model_loss_value:.4f} | "
-                f"Upd {num_updates:2d} | RealRatio {effective_real_ratio:.2f} | "
-                f"MaxDis {effective_max_disagreement:.2f} | "
-                f"RollKeep {rollkeep_str:>4} | RollH {rollout_horizon_now:2d} | "
-                f"MUpd {model_loss_updates} | DUpd {rollout_disagreement_updates}"
+                f"Upd {num_updates:2d} | RealRatio {effective_real_ratio:.3f} | ModelRatio {1.0 - effective_real_ratio:.3f} | "
+                f"MaxDis {effective_max_disagreement:.2f} | MeanDis {dis_ema_str:>5} | "
+                f"ThreshKeep {threshkeep_str:>4} | RollKeep {rollkeep_str:>4} | RollH {rollout_horizon_now:2d}"
             )
 
         if total_steps - last_eval >= cfg.eval_every:
@@ -1523,7 +1529,7 @@ def parse_args() -> Config:
     p.add_argument("--model_rollout_ramp_steps", type=int, default=1_000_000)
     p.add_argument("--rollout_keep_ratio", type=float, default=0.3)
     p.add_argument("--max_model_disagreement_start", type=float, default=0.5)
-    p.add_argument("--max_model_disagreement", type=float, default=1.2)
+    p.add_argument("--max_model_disagreement", type=float, default=1.5)
     p.add_argument("--max_model_disagreement_ramp_steps", type=int, default=10_000_000)
     p.add_argument("--real_ratio", type=float, default=0.9)
     p.add_argument("--model_warmup_steps", type=int, default=300_000)
