@@ -2,11 +2,34 @@
 import argparse
 import os
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
+
+def resolve_log_path(log_file: str) -> str:
+    if os.path.isdir(log_file):
+        return os.path.join(log_file, "mbpo_brax_train.log")
+    return log_file
 
 
 def try_import_jax_brax():
@@ -68,10 +91,10 @@ class Config:
     real_buffer_size: int = 1_000_000
     model_buffer_size: int = 100_000
     # SAC updates start with only real data, then gradually mix in more model data.
-    real_ratio: float = 0.9
-    model_warmup_steps: int = 300_000
+    real_ratio: float = 0.80
+    model_warmup_steps: int = 200_000
     # After model warmup, decay real_ratio from 1.0 to `real_ratio` over this many env steps.
-    real_ratio_ramp_steps: int = 10_000_000
+    real_ratio_ramp_steps: int = 5_000_000
 
     ensemble_size: int = 8
     model_train_epochs: int = 10
@@ -88,11 +111,12 @@ class Config:
     # Power > 1 makes rollout horizon growth slower early on.
     model_rollout_growth_power: float = 2.0
     # Keep only the lowest-uncertainty synthetic transitions.
-    rollout_keep_ratio: float = 0.3
+    # Set to 1.0 to disable top-k hard cap and rely on disagreement threshold only.
+    rollout_keep_ratio: float = 1.0
     # Optional hard threshold on ensemble disagreement (state_var/obs_dim + reward_var + done_var).
     # When > 0, a progressive schedule is used from start -> end (0 disables threshold).
-    max_model_disagreement_start: float = 0.5  # Stricter early filter
-    max_model_disagreement: float = 1.5  # Relax later but keep threshold meaningful
+    max_model_disagreement_start: float = 0.2  # Stricter early filter
+    max_model_disagreement: float = 0.8  # Relax later but keep threshold meaningful
     max_model_disagreement_ramp_steps: int = 10_000_000
 
     eval_every: int = 200_000
@@ -102,6 +126,8 @@ class Config:
     eval_episode_length: int = 500
     log_every: int = 10_000
     smooth_window: int = 7
+    log_file: str = "logs/mbpo_brax_train.log"
+    append_log: bool = False
 
 
 class ReplayBuffer:
@@ -1527,19 +1553,21 @@ def parse_args() -> Config:
     p.add_argument("--model_rollout_batch", type=int, default=2000)
     p.add_argument("--model_rollout_horizon_min", type=int, default=1)
     p.add_argument("--model_rollout_ramp_steps", type=int, default=1_000_000)
-    p.add_argument("--rollout_keep_ratio", type=float, default=0.3)
-    p.add_argument("--max_model_disagreement_start", type=float, default=0.5)
-    p.add_argument("--max_model_disagreement", type=float, default=1.5)
+    p.add_argument("--rollout_keep_ratio", type=float, default=1.0)
+    p.add_argument("--max_model_disagreement_start", type=float, default=0.2)
+    p.add_argument("--max_model_disagreement", type=float, default=0.8)
     p.add_argument("--max_model_disagreement_ramp_steps", type=int, default=10_000_000)
-    p.add_argument("--real_ratio", type=float, default=0.9)
-    p.add_argument("--model_warmup_steps", type=int, default=300_000)
-    p.add_argument("--real_ratio_ramp_steps", type=int, default=10_000_000)
+    p.add_argument("--real_ratio", type=float, default=0.80)
+    p.add_argument("--model_warmup_steps", type=int, default=200_000)
+    p.add_argument("--real_ratio_ramp_steps", type=int, default=5_000_000)
     p.add_argument("--eval_every", type=int, default=200_000)
     p.add_argument("--eval_num_envs", type=int, default=128)
     p.add_argument("--eval_episodes", type=int, default=10)
     p.add_argument("--eval_episode_length", type=int, default=500)
     p.add_argument("--log_every", type=int, default=10_000)
     p.add_argument("--smooth_window", type=int, default=7)
+    p.add_argument("--log_file", type=str, default="logs/mbpo_brax_train.log")
+    p.add_argument("--append_log", action="store_true")
 
     args = p.parse_args()
 
@@ -1583,8 +1611,27 @@ def parse_args() -> Config:
     cfg.eval_episode_length = args.eval_episode_length
     cfg.log_every = args.log_every
     cfg.smooth_window = args.smooth_window
+    cfg.log_file = args.log_file
+    cfg.append_log = args.append_log
     return cfg
 
 
 if __name__ == "__main__":
-    train(parse_args())
+    config = parse_args()
+    if config.log_file:
+        config.log_file = resolve_log_path(config.log_file)
+        os.makedirs(os.path.dirname(config.log_file) or ".", exist_ok=True)
+        log_mode = "a" if config.append_log else "w"
+        with open(config.log_file, log_mode, encoding="utf-8", buffering=1) as log_handle:
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+            sys.stdout = Tee(original_stdout, log_handle)
+            sys.stderr = Tee(original_stderr, log_handle)
+            try:
+                print(f"Logging to: {config.log_file}")
+                train(config)
+            finally:
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
+    else:
+        train(config)
