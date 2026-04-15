@@ -60,6 +60,8 @@ class Config:
 
     total_steps: int = 10_000_000
     num_envs: int = 512
+    # 0 means use all local devices; >0 selects the first N local devices for pmap.
+    num_devices: int = 0
     # Optional: shard environment collection across all local JAX devices.
     multi_device: bool = False
     # Optional: parallelize SAC learner (Stage D) across local devices.
@@ -91,32 +93,32 @@ class Config:
     real_buffer_size: int = 1_000_000
     model_buffer_size: int = 100_000
     # SAC updates start with only real data, then gradually mix in more model data.
-    real_ratio: float = 0.80
+    real_ratio: float = 0.88
     model_warmup_steps: int = 200_000
     # After model warmup, decay real_ratio from 1.0 to `real_ratio` over this many env steps.
-    real_ratio_ramp_steps: int = 5_000_000
+    real_ratio_ramp_steps: int = 6_000_000
 
     ensemble_size: int = 8
     model_train_epochs: int = 10
     model_done_loss_weight: float = 0.2
     model_train_freq: int = 500
     model_rollout_freq: int = 1_000
-    model_rollout_batch: int = 5_000
+    model_rollout_batch: int = 3_000
     # Rollout horizon starts small and grows toward model_rollout_horizon.
     model_rollout_horizon_min: int = 1
-    model_rollout_horizon: int = 1
-    model_rollout_ramp_steps: int = 10_000_000 # 模型 rollout horizon 从最小值逐步增加到最大值所需要的“过渡步数
+    model_rollout_horizon: int = 2
+    model_rollout_ramp_steps: int = 12_000_000 # 模型 rollout horizon 从最小值逐步增加到最大值所需要的“过渡步数
     # 模型生成的虚拟数据质量在训练初期可能较差，因此在前几个更新周期内，保持较短的模型生成轨迹长度，以减少模型误差的累积对学习的影响。
-    model_rollout_quality_warmup_updates: int = 3
+    model_rollout_quality_warmup_updates: int = 8
     # Power > 1 makes rollout horizon growth slower early on.
-    model_rollout_growth_power: float = 2.0
+    model_rollout_growth_power: float = 2.5
     # Keep only the lowest-uncertainty synthetic transitions.
     # Set to 1.0 to disable top-k hard cap and rely on disagreement threshold only.
-    rollout_keep_ratio: float = 1.0
+    rollout_keep_ratio: float = 0.75
     # Optional hard threshold on ensemble disagreement (state_var/obs_dim + reward_var + done_var).
     # When > 0, a progressive schedule is used from start -> end (0 disables threshold).
     max_model_disagreement_start: float = 0.2  # Stricter early filter
-    max_model_disagreement: float = 0.8  # Relax later but keep threshold meaningful
+    max_model_disagreement: float = 0.5  # Relax later but keep threshold meaningful
     max_model_disagreement_ramp_steps: int = 10_000_000
 
     eval_every: int = 200_000
@@ -565,13 +567,27 @@ def train(cfg: Config) -> None:
         return
 
     nn, jax, jnp, optax, train_state, envs = imported
-    local_devices = jax.local_device_count()
+    available_devices = jax.local_devices()
+    available_local_devices = len(available_devices)
+    if cfg.num_devices < 0:
+        raise ValueError(f"num_devices must be >= 0, got {cfg.num_devices}")
+    if cfg.num_devices == 0:
+        selected_devices = available_devices
+    else:
+        if cfg.num_devices > available_local_devices:
+            raise ValueError(
+                f"num_devices ({cfg.num_devices}) exceeds available local devices ({available_local_devices})."
+            )
+        selected_devices = available_devices[: cfg.num_devices]
+
+    local_devices = len(selected_devices)
     global_devices = jax.device_count()
     use_multi_device = bool(cfg.multi_device and local_devices > 1)
     use_parallel_learner = bool(cfg.parallel_learner and use_multi_device)
 
     print(f"JAX backend: {jax.default_backend()}")
-    print(f"JAX local devices ({local_devices}): {jax.local_devices()}")
+    print(f"JAX local devices available ({available_local_devices}): {available_devices}")
+    print(f"JAX selected local devices ({local_devices}): {selected_devices}")
     print(f"JAX global device_count: {global_devices} | process_index: {jax.process_index()}")
 
     if cfg.multi_device and local_devices <= 1:
@@ -594,7 +610,7 @@ def train(cfg: Config) -> None:
         f"alpha_lr={cfg.alpha_lr:.2e} model_lr={cfg.model_lr:.2e} "
         f"updates_per_step={cfg.updates_per_step:.3f} max_updates={cfg.max_sac_updates_per_iter} "
         f"multi_device={use_multi_device} parallel_learner={use_parallel_learner} "
-        f"local_devices={local_devices} global_devices={global_devices}"
+        f"local_devices={local_devices} global_devices={global_devices} num_devices_arg={cfg.num_devices}"
     )
 
     np.random.seed(cfg.seed)
@@ -606,8 +622,8 @@ def train(cfg: Config) -> None:
     eval_reset_fn = jax.jit(jax.vmap(env.reset))
     eval_step_fn = jax.jit(jax.vmap(env.step))
     if use_multi_device:
-        reset_fn = jax.jit(jax.pmap(jax.vmap(env.reset)))
-        step_fn = jax.jit(jax.pmap(jax.vmap(env.step)))
+        reset_fn = jax.jit(jax.pmap(jax.vmap(env.reset), devices=selected_devices))
+        step_fn = jax.jit(jax.pmap(jax.vmap(env.step), devices=selected_devices))
     else:
         reset_fn = eval_reset_fn
         step_fn = eval_step_fn
@@ -756,6 +772,7 @@ def train(cfg: Config) -> None:
         sac_update_parallel_fn = jax.pmap(
             sac_update_parallel_base_fn,
             axis_name="devices",
+            devices=selected_devices,
             in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None, 0),
         )
 
@@ -838,6 +855,7 @@ def train(cfg: Config) -> None:
         sac_multi_update_parallel_fn = jax.pmap(
             sac_multi_update_parallel_base_fn,
             axis_name="devices",
+            devices=selected_devices,
             in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, 0),
         )
 
@@ -955,7 +973,7 @@ def train(cfg: Config) -> None:
         return [jax.tree.map(lambda x, i=i: x[i], stacked_states) for i in range(cfg.ensemble_size)]
 
     if use_parallel_learner:
-        device_list = jax.local_devices()
+        device_list = selected_devices
 
         def replicate_tree(x):
             return jax.device_put_replicated(x, device_list)
@@ -1532,6 +1550,7 @@ def parse_args() -> Config:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--total_steps", type=int, default=10_000_000)
     p.add_argument("--num_envs", type=int, default=512)
+    p.add_argument("--num_devices", type=int, default=0)
     p.add_argument("--multi_device", action="store_true")
     p.add_argument("--parallel_learner", action="store_true")
     p.add_argument("--episode_length", type=int, default=1000)
@@ -1549,17 +1568,17 @@ def parse_args() -> Config:
     p.add_argument("--model_done_loss_weight", type=float, default=0.2)
     p.add_argument("--model_train_freq", type=int, default=500)
     p.add_argument("--model_rollout_freq", type=int, default=5000)
-    p.add_argument("--model_rollout_horizon", type=int, default=1)
-    p.add_argument("--model_rollout_batch", type=int, default=2000)
+    p.add_argument("--model_rollout_horizon", type=int, default=2)
+    p.add_argument("--model_rollout_batch", type=int, default=3000)
     p.add_argument("--model_rollout_horizon_min", type=int, default=1)
-    p.add_argument("--model_rollout_ramp_steps", type=int, default=1_000_000)
-    p.add_argument("--rollout_keep_ratio", type=float, default=1.0)
+    p.add_argument("--model_rollout_ramp_steps", type=int, default=12_000_000)
+    p.add_argument("--rollout_keep_ratio", type=float, default=0.75)
     p.add_argument("--max_model_disagreement_start", type=float, default=0.2)
-    p.add_argument("--max_model_disagreement", type=float, default=0.8)
+    p.add_argument("--max_model_disagreement", type=float, default=0.5)
     p.add_argument("--max_model_disagreement_ramp_steps", type=int, default=10_000_000)
-    p.add_argument("--real_ratio", type=float, default=0.80)
+    p.add_argument("--real_ratio", type=float, default=0.88)
     p.add_argument("--model_warmup_steps", type=int, default=200_000)
-    p.add_argument("--real_ratio_ramp_steps", type=int, default=5_000_000)
+    p.add_argument("--real_ratio_ramp_steps", type=int, default=6_000_000)
     p.add_argument("--eval_every", type=int, default=200_000)
     p.add_argument("--eval_num_envs", type=int, default=128)
     p.add_argument("--eval_episodes", type=int, default=10)
@@ -1577,6 +1596,7 @@ def parse_args() -> Config:
     cfg.seed = args.seed
     cfg.total_steps = args.total_steps
     cfg.num_envs = args.num_envs
+    cfg.num_devices = args.num_devices
     cfg.multi_device = args.multi_device
     cfg.parallel_learner = args.parallel_learner
     cfg.episode_length = args.episode_length
