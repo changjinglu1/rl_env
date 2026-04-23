@@ -58,7 +58,7 @@ class Config:
     backend: str = "spring"
     seed: int = 42
 
-    total_steps: int = 10_000_000
+    total_steps: int = 30_000_000
     num_envs: int = 512
     # 0 means use all local devices; >0 selects the first N local devices for pmap.
     num_devices: int = 0
@@ -84,7 +84,7 @@ class Config:
 
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
-    alpha_lr: float = 5e-5
+    alpha_lr: float = 3e-4
     model_lr: float = 3e-4
     grad_clip_norm: float = 5.0
 
@@ -93,7 +93,7 @@ class Config:
     real_buffer_size: int = 1_000_000
     model_buffer_size: int = 100_000
     # SAC updates start with only real data, then gradually mix in more model data.
-    real_ratio: float = 0.88
+    real_ratio: float = 0.85
     model_warmup_steps: int = 200_000
     # After model warmup, decay real_ratio from 1.0 to `real_ratio` over this many env steps.
     real_ratio_ramp_steps: int = 6_000_000
@@ -107,7 +107,7 @@ class Config:
     # Rollout horizon starts small and grows toward model_rollout_horizon.
     model_rollout_horizon_min: int = 1
     model_rollout_horizon: int = 2
-    model_rollout_ramp_steps: int = 12_000_000 # 模型 rollout horizon 从最小值逐步增加到最大值所需要的“过渡步数
+    model_rollout_ramp_steps: int = 5_000_000 # 模型 rollout horizon 从最小值逐步增加到最大值所需要的“过渡步数
     # 模型生成的虚拟数据质量在训练初期可能较差，因此在前几个更新周期内，保持较短的模型生成轨迹长度，以减少模型误差的累积对学习的影响。
     model_rollout_quality_warmup_updates: int = 8
     # Power > 1 makes rollout horizon growth slower early on.
@@ -125,9 +125,9 @@ class Config:
     # Number of parallel environments used only during evaluation.
     eval_num_envs: int = 128
     eval_episodes: int = 10
-    eval_episode_length: int = 500
+    eval_episode_length: int = 1000
     log_every: int = 10_000
-    smooth_window: int = 7
+    smooth_window: int = 8
     log_file: str = "logs/mbpo_brax_train.log"
     append_log: bool = False
 
@@ -1548,7 +1548,7 @@ def parse_args() -> Config:
     p.add_argument("--env", type=str, default="halfcheetah")
     p.add_argument("--backend", type=str, default="spring", choices=["spring", "positional", "generalized"])
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--total_steps", type=int, default=10_000_000)
+    p.add_argument("--total_steps", type=int, default=20_000_000)
     p.add_argument("--num_envs", type=int, default=512)
     p.add_argument("--num_devices", type=int, default=0)
     p.add_argument("--multi_device", action="store_true")
@@ -1571,20 +1571,20 @@ def parse_args() -> Config:
     p.add_argument("--model_rollout_horizon", type=int, default=2)
     p.add_argument("--model_rollout_batch", type=int, default=3000)
     p.add_argument("--model_rollout_horizon_min", type=int, default=1)
-    p.add_argument("--model_rollout_ramp_steps", type=int, default=12_000_000)
+    p.add_argument("--model_rollout_ramp_steps", type=int, default=5_000_000)
     p.add_argument("--rollout_keep_ratio", type=float, default=0.75)
     p.add_argument("--max_model_disagreement_start", type=float, default=0.2)
     p.add_argument("--max_model_disagreement", type=float, default=0.5)
     p.add_argument("--max_model_disagreement_ramp_steps", type=int, default=10_000_000)
-    p.add_argument("--real_ratio", type=float, default=0.88)
+    p.add_argument("--real_ratio", type=float, default=0.85)
     p.add_argument("--model_warmup_steps", type=int, default=200_000)
     p.add_argument("--real_ratio_ramp_steps", type=int, default=6_000_000)
     p.add_argument("--eval_every", type=int, default=200_000)
     p.add_argument("--eval_num_envs", type=int, default=128)
     p.add_argument("--eval_episodes", type=int, default=10)
-    p.add_argument("--eval_episode_length", type=int, default=500)
+    p.add_argument("--eval_episode_length", type=int, default=1000)
     p.add_argument("--log_every", type=int, default=10_000)
-    p.add_argument("--smooth_window", type=int, default=7)
+    p.add_argument("--smooth_window", type=int, default=8)
     p.add_argument("--log_file", type=str, default="logs/mbpo_brax_train.log")
     p.add_argument("--append_log", action="store_true")
 
