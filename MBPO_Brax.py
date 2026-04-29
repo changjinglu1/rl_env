@@ -74,7 +74,7 @@ class Config:
     batch_size: int = 256
     start_steps: int = 10_000
     # Gradient updates per environment step (can be fractional).
-    updates_per_step: float = 0.15
+    updates_per_step: float = 0.10
     # Hard cap to avoid very slow iterations when num_envs is large.
     max_sac_updates_per_iter: int = 64
     # Prevent entropy temperature from collapsing too far.
@@ -93,20 +93,20 @@ class Config:
     real_buffer_size: int = 1_000_000
     model_buffer_size: int = 100_000
     # SAC updates start with only real data, then gradually mix in more model data.
-    real_ratio: float = 0.85
+    real_ratio: float = 0.70
     model_warmup_steps: int = 200_000
     # After model warmup, decay real_ratio from 1.0 to `real_ratio` over this many env steps.
-    real_ratio_ramp_steps: int = 6_000_000
+    real_ratio_ramp_steps: int = 9_000_000
 
-    ensemble_size: int = 8
+    ensemble_size: int = 10
     model_train_epochs: int = 10
     model_done_loss_weight: float = 0.2
-    model_train_freq: int = 500
+    model_train_freq: int = 200
     model_rollout_freq: int = 1_000
     model_rollout_batch: int = 3_000
     # Rollout horizon starts small and grows toward model_rollout_horizon.
     model_rollout_horizon_min: int = 1
-    model_rollout_horizon: int = 2
+    model_rollout_horizon: int = 3
     model_rollout_ramp_steps: int = 5_000_000 # 模型 rollout horizon 从最小值逐步增加到最大值所需要的“过渡步数
     # 模型生成的虚拟数据质量在训练初期可能较差，因此在前几个更新周期内，保持较短的模型生成轨迹长度，以减少模型误差的累积对学习的影响。
     model_rollout_quality_warmup_updates: int = 8
@@ -1556,7 +1556,7 @@ def parse_args() -> Config:
     p.add_argument("--episode_length", type=int, default=1000)
     p.add_argument("--start_steps", type=int, default=10_000)
     p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--updates_per_step", type=float, default=0.15)
+    p.add_argument("--updates_per_step", type=float, default=0.10)
     p.add_argument("--max_sac_updates_per_iter", type=int, default=64)
     p.add_argument("--log_alpha_min", type=float, default=-8.0)
     p.add_argument("--log_alpha_max", type=float, default=2.0)
@@ -1566,9 +1566,9 @@ def parse_args() -> Config:
     p.add_argument("--model_lr", type=float, default=3e-4)
     p.add_argument("--grad_clip_norm", type=float, default=5.0)
     p.add_argument("--model_done_loss_weight", type=float, default=0.2)
-    p.add_argument("--model_train_freq", type=int, default=500)
+    p.add_argument("--model_train_freq", type=int, default=200)
     p.add_argument("--model_rollout_freq", type=int, default=5000)
-    p.add_argument("--model_rollout_horizon", type=int, default=2)
+    p.add_argument("--model_rollout_horizon", type=int, default=3)
     p.add_argument("--model_rollout_batch", type=int, default=3000)
     p.add_argument("--model_rollout_horizon_min", type=int, default=1)
     p.add_argument("--model_rollout_ramp_steps", type=int, default=5_000_000)
@@ -1576,9 +1576,9 @@ def parse_args() -> Config:
     p.add_argument("--max_model_disagreement_start", type=float, default=0.2)
     p.add_argument("--max_model_disagreement", type=float, default=0.5)
     p.add_argument("--max_model_disagreement_ramp_steps", type=int, default=10_000_000)
-    p.add_argument("--real_ratio", type=float, default=0.85)
+    p.add_argument("--real_ratio", type=float, default=0.70)
     p.add_argument("--model_warmup_steps", type=int, default=200_000)
-    p.add_argument("--real_ratio_ramp_steps", type=int, default=6_000_000)
+    p.add_argument("--real_ratio_ramp_steps", type=int, default=9_000_000)
     p.add_argument("--eval_every", type=int, default=200_000)
     p.add_argument("--eval_num_envs", type=int, default=128)
     p.add_argument("--eval_episodes", type=int, default=10)
